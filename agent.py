@@ -573,22 +573,17 @@ class GeminiTriageAgent:
             "fallback_error": error_reason,
         }
 
-    def investigate_event(self, event: NormalizedEvent) -> dict[str, Any]:
-        """
-        単一の不審候補イベントに対して Gemini Function Calling ループを実行します。
-        `max_depth = 3` を厳格に適用し、最大3往復で必ず調査を打ち切ってレポートを生成します。
-        オフライン環境や API 障害時は、ローカルルールによるフォールバック判定へ自動切替します。
-        """
+    def can_attempt_online_now(self) -> bool:
+        """現在オンラインの Gemini API へ問い合わせ可能か（クールダウン中でないか）を返します。"""
         if self.offline_only or self.client is None:
-            return self.investigate_offline(event, error_reason="オフライン専用モード")
+            return False
+        return time.monotonic() >= self._api_offline_until
 
-        now_mono = time.monotonic()
-        if now_mono < self._api_offline_until:
-            return self.investigate_offline(
-                event,
-                error_reason="Gemini API 一時停止中のためローカルフォールバック継続",
-            )
-
+    def _execute_gemini_triage_with_model_fallback(
+        self,
+        event: NormalizedEvent,
+    ) -> tuple[str, int, list[dict[str, Any]]]:
+        """自動モデル更新・404時後継切替を含めて Gemini 自律調査ループを実行します。"""
         if self.auto_model_enabled:
             self.refresh_latest_model(force=False)
 
@@ -617,21 +612,89 @@ class GeminiTriageAgent:
         depth = 0
         tool_trace: list[dict[str, Any]] = []
 
+        for attempt_idx in range(max_fallback_attempts + 1):
+            tried_models.add(self.model_name)
+            try:
+                report_text, depth, tool_trace = self._run_chat_triage_loop(prompt, base_config)
+                self._api_offline_until = 0.0
+                break
+            except APIError as api_err:
+                if (
+                    attempt_idx < max_fallback_attempts
+                    and self._is_model_unavailable_error(api_err)
+                    and self._switch_to_fallback_model(str(api_err), tried_models=tried_models)
+                ):
+                    continue
+                raise
+
+        if not report_text:
+            report_text = (
+                f"{config.SEVERITY_SUSPICIOUS}\n"
+                "- **判定理由**: Gemini からテキスト応答が返却されなかったため、一次スクリーニング結果に基づき要注意と判定しました。\n"
+                "- **推奨確認事項**: 該当プロセスの実行ファイルパスおよびコマンドライン引数を手動で確認してください。"
+            )
+        return report_text, depth, tool_trace
+
+    def try_reinvestigate_online(self, event: NormalizedEvent) -> dict[str, Any] | None:
+        """
+        オフラインフォールバックで暫定判定したイベントを、オンライン復旧後に
+        Gemini API で再トリアージします。
+        APIが依然として到達不能な場合は重複フォールバックレポートを出さず None を返します。
+        """
+        if not self.can_attempt_online_now():
+            return None
+
         try:
-            for attempt_idx in range(max_fallback_attempts + 1):
-                tried_models.add(self.model_name)
-                try:
-                    report_text, depth, tool_trace = self._run_chat_triage_loop(prompt, base_config)
-                    self._api_offline_until = 0.0
-                    break
-                except APIError as api_err:
-                    if (
-                        attempt_idx < max_fallback_attempts
-                        and self._is_model_unavailable_error(api_err)
-                        and self._switch_to_fallback_model(str(api_err), tried_models=tried_models)
-                    ):
-                        continue
-                    raise
+            report_text, depth, tool_trace = self._execute_gemini_triage_with_model_fallback(event)
+        except Exception as exc:
+            self._api_offline_until = time.monotonic() + config.API_OFFLINE_COOLDOWN_SECONDS
+            logger.info(
+                "オフライン保留イベント (RecordID=%d) のオンライン再判定を延期します (%d秒待機): %s",
+                event.event_record_id,
+                config.API_OFFLINE_COOLDOWN_SECONDS,
+                exc,
+            )
+            return None
+
+        severity = self._extract_severity(report_text)
+        reconciled_report = (
+            "✅ **【オンライン復旧・Gemini API 再判定レポート】** "
+            "オフラインフォールバック後に通信が復旧したため、Gemini API による再評価を実行しました。\n\n"
+            f"{report_text}"
+        )
+        report_file = self.append_triage_report(
+            event=event,
+            severity=severity,
+            report_text=reconciled_report,
+            tool_trace=tool_trace,
+        )
+        return {
+            "severity": severity,
+            "depth_used": depth,
+            "tool_trace": tool_trace,
+            "report_text": reconciled_report,
+            "report_file": str(report_file),
+            "offline_fallback": False,
+            "reconciled_from_offline": True,
+        }
+
+    def investigate_event(self, event: NormalizedEvent) -> dict[str, Any]:
+        """
+        単一の不審候補イベントに対して Gemini Function Calling ループを実行します。
+        `max_depth = 3` を厳格に適用し、最大3往復で必ず調査を打ち切ってレポートを生成します。
+        オフライン環境や API 障害時は、ローカルルールによるフォールバック判定へ自動切替します。
+        """
+        if self.offline_only or self.client is None:
+            return self.investigate_offline(event, error_reason="オフライン専用モード")
+
+        if not self.can_attempt_online_now():
+            return self.investigate_offline(
+                event,
+                error_reason="Gemini API 一時停止中のためローカルフォールバック継続",
+            )
+
+        try:
+            report_text, depth, tool_trace = self._execute_gemini_triage_with_model_fallback(event)
         except Exception as triage_exc:
             self._api_offline_until = time.monotonic() + config.API_OFFLINE_COOLDOWN_SECONDS
             logger.error(
@@ -640,13 +703,6 @@ class GeminiTriageAgent:
                 triage_exc,
             )
             return self.investigate_offline(event, error_reason=str(triage_exc))
-
-        if not report_text:
-            report_text = (
-                f"{config.SEVERITY_SUSPICIOUS}\n"
-                "- **判定理由**: Gemini からテキスト応答が返却されなかったため、一次スクリーニング結果に基づき要注意と判定しました。\n"
-                "- **推奨確認事項**: 該当プロセスの実行ファイルパスおよびコマンドライン引数を手動で確認してください。"
-            )
 
         severity = self._extract_severity(report_text)
         report_file = self.append_triage_report(

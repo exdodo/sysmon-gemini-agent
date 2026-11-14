@@ -16,7 +16,7 @@ import time
 
 from agent import GeminiTriageAgent
 import config
-from event_reader import CheckpointManager, WindowsEventReader
+from event_reader import CheckpointManager, NormalizedEvent, WindowsEventReader
 from process_guard import show_critical_response_dialog
 
 
@@ -102,6 +102,7 @@ def run_monitoring_loop(
 
     checkpoint_mgr = CheckpointManager(config.CHECKPOINT_FILE)
     event_reader = WindowsEventReader(checkpoint_mgr)
+    pending_offline_events: list[NormalizedEvent] = []
 
     try:
         while True:
@@ -113,7 +114,7 @@ def run_monitoring_loop(
                 logger.info("今回の巡回では一次スクリーニングに合致する不審候補イベントはありませんでした。")
             else:
                 logger.warning(
-                    "一次スクリーニングにより %d 件の不審候補イベントを抽出しました。Gemini トリアージを開始します。",
+                    "一次スクリーニングにより %d 件の不審候補イベントを抽出しました。トリアージを開始します。",
                     len(candidates),
                 )
                 for idx, candidate in enumerate(candidates, start=1):
@@ -138,7 +139,11 @@ def run_monitoring_loop(
                             candidate, error_reason=str(inv_exc)
                         )
 
-                    mode_note = " [オフライン/フォールバック]" if result.get("offline_fallback") else ""
+                    is_offline = bool(result.get("offline_fallback", False))
+                    if is_offline and not offline_only and len(pending_offline_events) < 50:
+                        pending_offline_events.append(candidate)
+
+                    mode_note = " [オフライン/フォールバック]" if is_offline else ""
                     logger.info(
                         "[%d/%d] 調査完了%s: 判定=%s, ツール往復回数=%d/%d, 出力先=%s",
                         idx,
@@ -155,6 +160,29 @@ def run_monitoring_loop(
                             result.get("report_text", ""),
                             result.get("report_file", ""),
                         )
+
+            if pending_offline_events and triage_agent.can_attempt_online_now():
+                remaining_offline: list[Any] = []
+                stopped_early = False
+                for idx_p, pending_ev in enumerate(pending_offline_events):
+                    re_res = triage_agent.try_reinvestigate_online(pending_ev)
+                    if re_res is None:
+                        remaining_offline.extend(pending_offline_events[idx_p:])
+                        stopped_early = True
+                        break
+                    logger.info(
+                        "[オフライン保留分 再判定完了] RecordID=%d -> %s (出力先=%s)",
+                        pending_ev.event_record_id,
+                        re_res["severity"],
+                        re_res["report_file"],
+                    )
+                    if re_res["severity"] == config.SEVERITY_CRITICAL:
+                        show_critical_response_dialog(
+                            pending_ev,
+                            re_res.get("report_text", ""),
+                            re_res.get("report_file", ""),
+                        )
+                pending_offline_events = remaining_offline if stopped_early else []
 
             checkpoint_mgr.save()
 

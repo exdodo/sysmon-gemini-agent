@@ -120,6 +120,8 @@ class SysmonTrayApp:
         self.status_message: str = "初期化中..."
         self.last_report_path: str = ""
         self.last_critical_incident: tuple[NormalizedEvent, str, str] | None = None
+        self._active_confirmed_alert: bool = False
+        self._pending_offline_alerts: list[tuple[NormalizedEvent, str]] = []
         self._stop_event = threading.Event()
         self._scan_now_event = threading.Event()
         self._lock = threading.Lock()
@@ -220,6 +222,8 @@ class SysmonTrayApp:
     def _on_reset_status(self, icon: Any, item: Any) -> None:
         """赤色・黄色になったアイコンを確認後に緑色（正常監視中）へ戻します。"""
         logger.info("ユーザー操作によりアイコン状態を正常（緑）にリセットしました。")
+        self._active_confirmed_alert = False
+        self._pending_offline_alerts.clear()
         self.set_status(STATE_NORMAL, "正常監視中 (リセット済)")
 
     def _on_exit(self, icon: Any, item: Any) -> None:
@@ -237,10 +241,146 @@ class SysmonTrayApp:
         except Exception:
             return False
 
+    @staticmethod
+    def _event_identity(event: NormalizedEvent) -> tuple[str, int, int, str]:
+        """オフライン保留イベントの重複管理・照合用キーを返します。"""
+        return (event.channel, event.event_id, event.event_record_id, event.utc_time)
+
+    def _record_pending_offline_alert(self, event: NormalizedEvent, severity: str) -> None:
+        """オフラインフォールバックで発報されたアラートをオンライン復帰後の再判定キューへ登録します。"""
+        ev_id = self._event_identity(event)
+        if any(self._event_identity(existing) == ev_id for existing, _ in self._pending_offline_alerts):
+            return
+        self._pending_offline_alerts.append((event, severity))
+        if len(self._pending_offline_alerts) > 50:
+            self._pending_offline_alerts.pop(0)
+
+    def _apply_triage_result(
+        self,
+        candidate: NormalizedEvent,
+        result: dict[str, Any],
+        from_reconciliation: bool = False,
+        previous_offline_severity: str = "",
+    ) -> None:
+        """トリアージ結果をトレイ状態・アラート原因フラグ・通知・迎撃パネルへ反映します。"""
+        severity = result.get("severity", config.SEVERITY_SUSPICIOUS)
+        is_offline = bool(result.get("offline_fallback", False))
+        offline_tag = "・オフライン判定" if is_offline else ("・再判定確定" if from_reconciliation else "")
+        self.last_report_path = result.get("report_file", "") or self.last_report_path
+
+        if is_offline and not self.offline_only:
+            if severity in (config.SEVERITY_CRITICAL, config.SEVERITY_SUSPICIOUS):
+                self._record_pending_offline_alert(candidate, severity)
+        else:
+            if severity in (config.SEVERITY_CRITICAL, config.SEVERITY_SUSPICIOUS):
+                self._active_confirmed_alert = True
+            elif severity == config.SEVERITY_CLEAN and from_reconciliation:
+                if (
+                    self.last_critical_incident is not None
+                    and self._event_identity(self.last_critical_incident[0]) == self._event_identity(candidate)
+                ):
+                    self.last_critical_incident = None
+                return
+
+        if severity == config.SEVERITY_CRITICAL:
+            rep_text = result.get("report_text", "")
+            self.last_critical_incident = (
+                candidate,
+                rep_text,
+                self.last_report_path,
+            )
+            proc_check = verify_target_process(
+                candidate.process_id,
+                candidate.image,
+                candidate.utc_time,
+            )
+            alive_tag = (
+                "稼働中・迎撃可"
+                if (proc_check.is_alive and proc_check.is_verified_same_process)
+                else "終了済/保護"
+            )
+            self.set_status(
+                STATE_CRITICAL,
+                f"[CRITICAL{offline_tag}] 脅威検知 ({alive_tag}: PID={candidate.process_id})",
+                notify_title=f"【緊急{offline_tag}】CRITICAL アラート検知",
+            )
+            already_shown_critical = (
+                from_reconciliation and previous_offline_severity == config.SEVERITY_CRITICAL
+            )
+            if not already_shown_critical:
+                show_critical_response_dialog(
+                    candidate,
+                    rep_text,
+                    self.last_report_path,
+                )
+        elif severity == config.SEVERITY_SUSPICIOUS and self.current_state != STATE_CRITICAL:
+            self.set_status(
+                STATE_SUSPICIOUS,
+                f"[SUSPICIOUS{offline_tag}] 要注意イベント検知 (EventID={candidate.event_id})",
+                notify_title=f"【警告{offline_tag}】SUSPICIOUS イベント検知",
+            )
+
+    def _reconcile_pending_offline_alerts(self) -> None:
+        """
+        オフラインフォールバックで暫定警告していたイベントをオンライン復旧後に Gemini API で再判定し、
+        ほかにアラート原因がなければトレイアイコンを元の緑色（正常監視中）へ自動復帰させます。
+        """
+        if (
+            self.triage_agent is None
+            or not self._pending_offline_alerts
+            or not self.triage_agent.can_attempt_online_now()
+        ):
+            return
+
+        resolved_any_clean = False
+        pending_snapshot = list(self._pending_offline_alerts)
+        for ev, prev_sev in pending_snapshot:
+            if self._stop_event.is_set():
+                break
+            re_res = self.triage_agent.try_reinvestigate_online(ev)
+            if re_res is None:
+                # まだオフライン状態のため残りは次回以降に持ち越し
+                break
+
+            ev_id = self._event_identity(ev)
+            self._pending_offline_alerts = [
+                item for item in self._pending_offline_alerts if self._event_identity(item[0]) != ev_id
+            ]
+            self._apply_triage_result(
+                ev,
+                re_res,
+                from_reconciliation=True,
+                previous_offline_severity=prev_sev,
+            )
+            if re_res.get("severity") == config.SEVERITY_CLEAN:
+                resolved_any_clean = True
+                logger.info(
+                    "オフライン保留イベント (EventID=%d, RecordID=%d) は Gemini API 再判定で [CLEAN] と確定しました。",
+                    ev.event_id,
+                    ev.event_record_id,
+                )
+
+        if (
+            resolved_any_clean
+            and not self._pending_offline_alerts
+            and not self._active_confirmed_alert
+            and self.current_state != STATE_NORMAL
+        ):
+            logger.info(
+                "オフラインフォールバック判定イベントがすべて Gemini API により [CLEAN] と確認されたため、"
+                "アイコン状態を正常（緑）へ自動復帰します。"
+            )
+            self.set_status(
+                STATE_NORMAL,
+                f"正常監視中 ({self.triage_agent.model_name}・オフライン保留分[CLEAN]復帰)",
+                notify_title="Sysmon Gemini 監視エージェント [正常復帰]",
+            )
+
     def _monitoring_worker(self) -> None:
-        """バックグラウンドで 60 秒ごとにイベントログ巡回と Gemini トリアージを行うスレッド。"""
+        """バックグラウンドで定期巡回とトリアージを行うワーカースレッド。"""
         if not self._is_admin():
             logger.warning("管理者権限なしで起動されました。イベントログの読み取りに失敗する可能性があります。")
+            self._active_confirmed_alert = True
             self.set_status(
                 STATE_CRITICAL,
                 "エラー: 管理者権限で実行してください",
@@ -259,6 +399,7 @@ class SysmonTrayApp:
                 self.set_status(STATE_NORMAL, f"正常監視中 ({mode_label})")
         except Exception as init_exc:
             logger.error("Gemini エージェントの初期化エラー: %s", init_exc)
+            self._active_confirmed_alert = True
             self.set_status(
                 STATE_CRITICAL,
                 f"初期化エラー: {init_exc}",
@@ -286,47 +427,16 @@ class SysmonTrayApp:
                                 candidate, error_reason=str(cand_exc)
                             )
 
-                        severity = result.get("severity", config.SEVERITY_SUSPICIOUS)
-                        is_offline = bool(result.get("offline_fallback", False))
-                        offline_tag = "・オフライン判定" if is_offline else ""
-                        self.last_report_path = result.get("report_file", "")
+                        self._apply_triage_result(candidate, result, from_reconciliation=False)
 
-                        if severity == config.SEVERITY_CRITICAL:
-                            rep_text = result.get("report_text", "")
-                            self.last_critical_incident = (
-                                candidate,
-                                rep_text,
-                                self.last_report_path,
-                            )
-                            proc_check = verify_target_process(
-                                candidate.process_id,
-                                candidate.image,
-                                candidate.utc_time,
-                            )
-                            alive_tag = "稼働中・迎撃可" if (proc_check.is_alive and proc_check.is_verified_same_process) else "終了済/保護"
-                            # [CRITICAL] 検知時はアイコンを赤色に変更して通知 & ワンクリック迎撃パネルを表示
-                            self.set_status(
-                                STATE_CRITICAL,
-                                f"[CRITICAL{offline_tag}] 脅威検知 ({alive_tag}: PID={candidate.process_id})",
-                                notify_title=f"【緊急{offline_tag}】CRITICAL アラート検知",
-                            )
-                            show_critical_response_dialog(
-                                candidate,
-                                rep_text,
-                                self.last_report_path,
-                            )
-                        elif severity == config.SEVERITY_SUSPICIOUS and self.current_state != STATE_CRITICAL:
-                            # [SUSPICIOUS] 検知時は赤色でなければ黄色に変更して通知
-                            self.set_status(
-                                STATE_SUSPICIOUS,
-                                f"[SUSPICIOUS{offline_tag}] 要注意イベント検知 (EventID={candidate.event_id})",
-                                notify_title=f"【警告{offline_tag}】SUSPICIOUS イベント検知",
-                            )
+                # オフラインフォールバック保留分があればオンライン復旧後に再判定し、条件を満たせば緑色へ自動復帰
+                self._reconcile_pending_offline_alerts()
 
                 self.checkpoint_mgr.save()
 
             except Exception as loop_exc:
                 logger.error("巡回ループ内で深刻なエラーが発生しました: %s", loop_exc)
+                self._active_confirmed_alert = True
                 self.set_status(
                     STATE_CRITICAL,
                     f"実行エラー: {loop_exc}",
