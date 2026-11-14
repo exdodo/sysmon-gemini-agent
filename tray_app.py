@@ -103,7 +103,11 @@ class SysmonTrayApp:
     アイコンを赤色へ変更＋デスクトップ通知を行う常駐アプリケーションクラス。
     """
 
-    def __init__(self, poll_interval: int = config.POLL_INTERVAL_SECONDS) -> None:
+    def __init__(
+        self,
+        poll_interval: int = config.POLL_INTERVAL_SECONDS,
+        offline_only: bool = False,
+    ) -> None:
         if not HAS_TRAY_DEPS or pystray is None:
             raise ImportError(
                 "タスクバー常駐機能には 'pystray' と 'Pillow' が必要です。"
@@ -111,6 +115,7 @@ class SysmonTrayApp:
             )
 
         self.poll_interval: int = poll_interval
+        self.offline_only: bool = offline_only
         self.current_state: str = STATE_NORMAL
         self.status_message: str = "初期化中..."
         self.last_report_path: str = ""
@@ -247,9 +252,11 @@ class SysmonTrayApp:
                 model_name=config.GEMINI_MODEL,
                 max_depth=config.MAX_DEPTH,
                 alerts_dir=config.ALERTS_DIR,
+                offline_only=self.offline_only,
             )
             if self.current_state != STATE_CRITICAL:
-                self.set_status(STATE_NORMAL, f"正常監視中 ({self.triage_agent.model_name})")
+                mode_label = "オフラインルール監視" if self.offline_only else self.triage_agent.model_name
+                self.set_status(STATE_NORMAL, f"正常監視中 ({mode_label})")
         except Exception as init_exc:
             logger.error("Gemini エージェントの初期化エラー: %s", init_exc)
             self.set_status(
@@ -263,12 +270,25 @@ class SysmonTrayApp:
             try:
                 candidates = self.event_reader.poll_suspicious_candidates()
                 if candidates:
-                    logger.warning("不審候補を %d 件検出。Gemini トリアージを実行します。", len(candidates))
+                    logger.warning("不審候補を %d 件検出。トリアージを実行します。", len(candidates))
                     for candidate in candidates:
                         if self._stop_event.is_set():
                             break
-                        result = self.triage_agent.investigate_event(candidate)
+                        try:
+                            result = self.triage_agent.investigate_event(candidate)
+                        except Exception as cand_exc:
+                            logger.error(
+                                "EventRecordID=%d の調査中に予期しない例外が発生したため、オフラインフォールバックを実行します: %s",
+                                candidate.event_record_id,
+                                cand_exc,
+                            )
+                            result = self.triage_agent.investigate_offline(
+                                candidate, error_reason=str(cand_exc)
+                            )
+
                         severity = result.get("severity", config.SEVERITY_SUSPICIOUS)
+                        is_offline = bool(result.get("offline_fallback", False))
+                        offline_tag = "・オフライン判定" if is_offline else ""
                         self.last_report_path = result.get("report_file", "")
 
                         if severity == config.SEVERITY_CRITICAL:
@@ -287,8 +307,8 @@ class SysmonTrayApp:
                             # [CRITICAL] 検知時はアイコンを赤色に変更して通知 & ワンクリック迎撃パネルを表示
                             self.set_status(
                                 STATE_CRITICAL,
-                                f"[CRITICAL] 脅威検知 ({alive_tag}: PID={candidate.process_id})",
-                                notify_title="【緊急】CRITICAL アラート検知",
+                                f"[CRITICAL{offline_tag}] 脅威検知 ({alive_tag}: PID={candidate.process_id})",
+                                notify_title=f"【緊急{offline_tag}】CRITICAL アラート検知",
                             )
                             show_critical_response_dialog(
                                 candidate,
@@ -299,8 +319,8 @@ class SysmonTrayApp:
                             # [SUSPICIOUS] 検知時は赤色でなければ黄色に変更して通知
                             self.set_status(
                                 STATE_SUSPICIOUS,
-                                f"[SUSPICIOUS] 要注意イベント検知 (EventID={candidate.event_id})",
-                                notify_title="【警告】SUSPICIOUS イベント検知",
+                                f"[SUSPICIOUS{offline_tag}] 要注意イベント検知 (EventID={candidate.event_id})",
+                                notify_title=f"【警告{offline_tag}】SUSPICIOUS イベント検知",
                             )
 
                 self.checkpoint_mgr.save()

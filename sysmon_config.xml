@@ -1,0 +1,97 @@
+<!--
+  Sysmon 監視拡張設定ファイル (sysmon_config.xml) — Windows Event Log & Sysmon 監視エージェント v1.10 用
+  対応 Event ID:
+    - ID 1  : ProcessCreate (プロセス生成)
+    - ID 3  : NetworkConnect (外部ネットワーク接続 ※ループバック除外)
+    - ID 8  : CreateRemoteThread (スレッド注入 / DLLインジェクション)
+    - ID 10 : ProcessAccess (LSASSメモリへの高権限アクセス・認証情報ダンプ検知)
+    - ID 11 : FileCreate (スタートアップ・タスク・Temp/Public等へのファイル作成)
+    - ID 12/13/14 : RegistryEvent (永続化Runキー・IFEO・Sysmon/Defender改ざん・UACバイパス)
+    - ID 22 : DnsQuery (DNS名前解決 ※高負荷なローカル通信を除外)
+
+  適用方法 (管理者権限の PowerShell で実行):
+    sysmon64.exe -c .\sysmon_config.xml
+    (新規インストール時: sysmon64.exe -accepteula -i .\sysmon_config.xml)
+-->
+<Sysmon schemaversion="4.90">
+  <HashAlgorithms>sha256</HashAlgorithms>
+  <EventFiltering>
+
+    <!-- Event ID 1: プロセス生成 (原則すべて記録) -->
+    <RuleGroup name="ProcessCreate" groupRelation="or">
+      <ProcessCreate onmatch="exclude" />
+    </RuleGroup>
+
+    <!-- Event ID 3: ネットワーク接続 (ループバックのみ除外) -->
+    <RuleGroup name="NetworkConnect" groupRelation="or">
+      <NetworkConnect onmatch="exclude">
+        <DestinationIp condition="is">127.0.0.1</DestinationIp>
+        <DestinationIp condition="is">::1</DestinationIp>
+      </NetworkConnect>
+    </RuleGroup>
+
+    <!-- Event ID 8: CreateRemoteThread (OS中枢プロセス自体の標準動作を除外) -->
+    <RuleGroup name="CreateRemoteThread" groupRelation="or">
+      <CreateRemoteThread onmatch="exclude">
+        <SourceImage condition="is">C:\Windows\System32\csrss.exe</SourceImage>
+        <SourceImage condition="is">C:\Windows\System32\wininit.exe</SourceImage>
+        <SourceImage condition="is">C:\Windows\System32\smss.exe</SourceImage>
+        <SourceImage condition="is">C:\Windows\System32\services.exe</SourceImage>
+      </CreateRemoteThread>
+    </RuleGroup>
+
+    <!-- Event ID 10: ProcessAccess (LSASSへのアクセスを集中監視して負荷を抑制) -->
+    <RuleGroup name="ProcessAccess_LSASS" groupRelation="or">
+      <ProcessAccess onmatch="include">
+        <TargetImage condition="is">C:\Windows\system32\lsass.exe</TargetImage>
+        <TargetImage condition="is">C:\Windows\System32\lsass.exe</TargetImage>
+      </ProcessAccess>
+    </RuleGroup>
+
+    <!-- Event ID 11: FileCreate (永続化・一時/公開ディレクトリへの作成を記録) -->
+    <RuleGroup name="FileCreate_Targeted" groupRelation="or">
+      <FileCreate onmatch="include">
+        <TargetFilename condition="contains">\Start Menu\Programs\Startup\</TargetFilename>
+        <TargetFilename condition="contains">\Windows\System32\Tasks\</TargetFilename>
+        <TargetFilename condition="contains">\Windows\Tasks\</TargetFilename>
+        <TargetFilename condition="contains">\Users\Public\</TargetFilename>
+        <TargetFilename condition="contains">\Windows\Temp\</TargetFilename>
+        <TargetFilename condition="contains">\AppData\Local\Temp\</TargetFilename>
+        <TargetFilename condition="contains">\AppData\Roaming\</TargetFilename>
+        <TargetFilename condition="contains">\ProgramData\</TargetFilename>
+        <TargetFilename condition="contains any">readme_for_decrypt;how_to_decrypt;decrypt_instruction;recover_files;_readme.txt</TargetFilename>
+      </FileCreate>
+    </RuleGroup>
+
+    <!-- Event ID 12, 13, 14: RegistryEvent (永続化・防衛無効化・UACバイパス) -->
+    <RuleGroup name="RegistryEvent_Targeted" groupRelation="or">
+      <RegistryEvent onmatch="include">
+        <TargetObject condition="contains">\CurrentVersion\Run</TargetObject>
+        <TargetObject condition="contains">\Winlogon\Shell</TargetObject>
+        <TargetObject condition="contains">\Winlogon\Userinit</TargetObject>
+        <TargetObject condition="contains">\Winlogon\Notify</TargetObject>
+        <TargetObject condition="contains">\Image File Execution Options\</TargetObject>
+        <TargetObject condition="contains">\AppInit_DLLs</TargetObject>
+        <TargetObject condition="contains">\Services\Sysmon</TargetObject>
+        <TargetObject condition="contains">\Services\EventLog</TargetObject>
+        <TargetObject condition="contains">\Services\WinDefend</TargetObject>
+        <TargetObject condition="contains">\Policies\Microsoft\Windows Defender</TargetObject>
+        <TargetObject condition="contains">\Control\Lsa\</TargetObject>
+        <TargetObject condition="contains">\Classes\ms-settings\shell\open\command</TargetObject>
+        <TargetObject condition="contains">\Classes\mscfile\shell\open\command</TargetObject>
+        <TargetObject condition="contains">Shell Folders\Startup</TargetObject>
+      </RegistryEvent>
+    </RuleGroup>
+
+    <!-- Event ID 22: DnsQuery (ローカル名前解決・逆引きのノイズを除外) -->
+    <RuleGroup name="DnsQuery_Filtered" groupRelation="or">
+      <DnsQuery onmatch="exclude">
+        <QueryName condition="is">localhost</QueryName>
+        <QueryName condition="is">wpad</QueryName>
+        <QueryName condition="end with">.local</QueryName>
+        <QueryName condition="end with">.arpa</QueryName>
+      </DnsQuery>
+    </RuleGroup>
+
+  </EventFiltering>
+</Sysmon>

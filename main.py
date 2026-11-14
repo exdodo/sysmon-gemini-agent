@@ -58,14 +58,23 @@ def is_running_as_admin() -> bool:
         return False
 
 
-def run_monitoring_loop(poll_interval: int = config.POLL_INTERVAL_SECONDS, run_once: bool = False) -> int:
+def run_monitoring_loop(
+    poll_interval: int = config.POLL_INTERVAL_SECONDS,
+    run_once: bool = False,
+    offline_only: bool = False,
+) -> int:
     """
     定期巡回デーモンのメインループを実行します。
     """
     logger = setup_logging()
     logger.info("============================================================")
     logger.info("Windows Event Log & Sysmon 監視エージェント (Google Gemini版) v%s 起動", config.APP_VERSION)
-    logger.info("使用モデル: %s | 最大調査ループ上限 (max_depth): %d", config.GEMINI_MODEL, config.MAX_DEPTH)
+    logger.info(
+        "使用モデル: %s | 最大調査ループ上限 (max_depth): %d | オフライン専用: %s",
+        "offline-rule-engine" if offline_only else config.GEMINI_MODEL,
+        config.MAX_DEPTH,
+        offline_only,
+    )
     logger.info("巡回間隔: %d 秒 | チェックポイント: %s", poll_interval, config.CHECKPOINT_FILE)
     logger.info("============================================================")
 
@@ -81,6 +90,7 @@ def run_monitoring_loop(poll_interval: int = config.POLL_INTERVAL_SECONDS, run_o
             model_name=config.GEMINI_MODEL,
             max_depth=config.MAX_DEPTH,
             alerts_dir=config.ALERTS_DIR,
+            offline_only=offline_only,
         )
         logger.info("有効化された実使用モデル: %s", triage_agent.model_name)
     except EnvironmentError as env_err:
@@ -118,26 +128,32 @@ def run_monitoring_loop(poll_interval: int = config.POLL_INTERVAL_SECONDS, run_o
                     )
                     try:
                         result = triage_agent.investigate_event(candidate)
-                        logger.info(
-                            "[%d/%d] 調査完了: 判定=%s, ツール往復回数=%d/%d, 出力先=%s",
-                            idx,
-                            len(candidates),
-                            result["severity"],
-                            result["depth_used"],
-                            config.MAX_DEPTH,
-                            result["report_file"],
-                        )
-                        if result["severity"] == config.SEVERITY_CRITICAL:
-                            show_critical_response_dialog(
-                                candidate,
-                                result.get("report_text", ""),
-                                result.get("report_file", ""),
-                            )
                     except Exception as inv_exc:
                         logger.error(
-                            "EventRecordID=%d の Gemini 調査中にエラーが発生しました: %s",
+                            "EventRecordID=%d の Gemini 調査中に例外が発生したため、オフラインフォールバックを実行します: %s",
                             candidate.event_record_id,
                             inv_exc,
+                        )
+                        result = triage_agent.investigate_offline(
+                            candidate, error_reason=str(inv_exc)
+                        )
+
+                    mode_note = " [オフライン/フォールバック]" if result.get("offline_fallback") else ""
+                    logger.info(
+                        "[%d/%d] 調査完了%s: 判定=%s, ツール往復回数=%d/%d, 出力先=%s",
+                        idx,
+                        len(candidates),
+                        mode_note,
+                        result["severity"],
+                        result["depth_used"],
+                        config.MAX_DEPTH,
+                        result["report_file"],
+                    )
+                    if result["severity"] == config.SEVERITY_CRITICAL:
+                        show_critical_response_dialog(
+                            candidate,
+                            result.get("report_text", ""),
+                            result.get("report_file", ""),
                         )
 
             checkpoint_mgr.save()
@@ -179,6 +195,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="タスクバー（システムトレイ）にアイコンを表示して常駐監視します（深刻なエラーや [CRITICAL] 検知時に赤色へ変化）。",
     )
     parser.add_argument(
+        "--offline",
+        action="store_true",
+        help="Gemini API を呼び出さず、ルールベースの一次検知・オフライン判定のみで監視します。",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s v{config.APP_VERSION}",
@@ -192,6 +213,12 @@ if __name__ == "__main__":
         setup_logging()
         from tray_app import SysmonTrayApp
 
-        app = SysmonTrayApp(poll_interval=args.interval)
+        app = SysmonTrayApp(poll_interval=args.interval, offline_only=args.offline)
         sys.exit(app.run())
-    sys.exit(run_monitoring_loop(poll_interval=args.interval, run_once=args.once))
+    sys.exit(
+        run_monitoring_loop(
+            poll_interval=args.interval,
+            run_once=args.once,
+            offline_only=args.offline,
+        )
+    )

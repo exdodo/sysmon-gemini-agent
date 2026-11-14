@@ -2,6 +2,20 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.10] - 2026-11-14
+監視対象の攻撃ベクトル拡張（Sysmon ID `8, 10, 11, 12, 13, 22` 対応）およびオフライン・API障害時の通知フォールバックを実装。
+
+### 追加・改善
+- **監視イベント・攻撃ベクトル拡張 (`config.py`, `event_reader.py`, `tools.py`, `sysmon_config.xml`)**:
+  - Sysmon Event ID `8` (`CreateRemoteThread`: スレッド/シェルコード注入)、`10` (`ProcessAccess`: LSASSメモリ読取・高権限アクセス)、`11` (`FileCreate`: スタートアップ/タスク投下・LOLBin/Officeドロップ・ランサムノート検知)、`12`/`13` (`RegistryEvent`: Runキー永続化・IFEO・Winlogon・UACバイパス・Sysmon/Defender無効化)、`22` (`DNSEvent`: LOLBin/Temp名前解決・ダイナミックDNS・DNSトンネリング) のXMLパースおよび専用一次スクリーニングルールを追加。
+  - 収集・インメモリキャッシュ上限を拡張 (`MAX_EVENTS_PER_POLL = 1000`, `RECENT_EVENT_CACHE_SIZE = 4000`)。
+  - Gemini Read-Only ツール `get_process_related_events(process_id)` を追加し、`get_process_network_activity` も DNS (`ID 22`) を参照可能に拡張。
+  - 低ノイズで拡張イベントを収集できる Sysmon 設定テンプレート [sysmon_config.xml](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/sysmon_config.xml) を同梱。
+- **オフライン・API障害時の一次検知フォールバック (`agent.py`, `tray_app.py`, `main.py`, `config.py`)**:
+  - Gemini API 通信障害・レート制限超過・タイムアウト時にローカルルール判定（`[CRITICAL]` / `[SUSPICIOUS]`）へ自動切替する `classify_offline_severity()` / `investigate_offline()` および 60秒サーキットブレーカー (`API_OFFLINE_COOLDOWN_SECONDS = 60`) を実装。
+  - オフラインフォールバック時も `alerts/incident_YYYYMMDD.md` への追記、トレイアイコンの赤/黄変化・デスクトップ通知、Microsoft Defender 緊急スキャン通報、`[CRITICAL]` 迎撃パネル表示が途切れず動作。
+  - Gemini API キー不要のオフライン専用起動オプション `--offline` を追加。
+
 ## [1.00] - 2026-11-14
 初期ベースラインリリース（現在までの実装・改善内容を統合）。
 

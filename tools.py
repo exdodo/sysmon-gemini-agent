@@ -181,25 +181,25 @@ def get_parent_process(parent_process_id: int) -> dict:
 
 
 def get_process_network_activity(process_id: int) -> list[dict]:
-    """指定されたプロセスID (ProcessId) が行った外部通信ログ (Sysmon Event ID 3) の一覧を取得します。
+    """指定されたプロセスID (ProcessId) が行った外部通信ログ (Sysmon Event ID 3) およびDNSクエリ (Event ID 22) の一覧を取得します。
 
-    不審なプロセスが外部のC2サーバ、不審なIPアドレス、または非標準ポートへ通信（ダウンローダ挙動や
-    情報窃取・リバースシェル等）を行っていないかを確認するために使用します。
+    不審なプロセスが外部のC2サーバ、不審なドメイン・IPアドレス、または非標準ポートへ通信（ダウンローダ挙動や
+    情報窃取・DNSトンネリング・リバースシェル等）を行っていないかを確認するために使用します。
     システムへの変更は一切行わない完全読み取り専用ツールです。
 
     Args:
         process_id: 通信履歴を調査する対象プロセスのプロセスID (PID, 整数値)。
 
     Returns:
-        list[dict]: 当該プロセスによるネットワーク接続イベント（最大20件）のリスト。
+        list[dict]: 当該プロセスによるネットワーク接続およびDNSクエリイベント（最大20件）のリスト。
             各要素は以下のキーを持つトークン最適化済み辞書です:
-            - UtcTime (str): 通信発生時刻 (UTC)
+            - UtcTime (str): 通信・名前解決発生時刻 (UTC)
             - ProcessId (int | None): 通信元プロセスのPID
             - Image (str): 通信元プロセスの実行ファイルパス
-            - CommandLine (str): コマンドライン（Sysmon ID 3で取得可能な場合）
+            - CommandLine (str): コマンドラインまたはDNSクエリ情報
             - ParentProcessId (int | None): 親プロセスPID
             - ParentCommandLine (str): 親プロセスコマンドライン
-            - DestinationIp (str): 接続先IPアドレス
+            - DestinationIp (str): 接続先または名前解決結果IPアドレス
             - DestinationPort (int | None): 接続先ポート番号
     """
     try:
@@ -211,14 +211,14 @@ def get_process_network_activity(process_id: int) -> list[dict]:
 
     matched_records: dict[int, dict[str, Any]] = {}
 
-    # 1. インメモリキャッシュ内の Sysmon Event ID 3 を検索
+    # 1. インメモリキャッシュ内の Sysmon Event ID 3 / 22 を検索
     for ev in get_cached_events():
-        if ev.event_id == 3 and ev.process_id == target_pid:
+        if ev.event_id in (3, 22) and ev.process_id == target_pid:
             matched_records[ev.event_record_id] = ev.to_trimmed_dict()
 
-    # 2. Sysmon Event ID 3 から対象PIDのネットワーク接続イベントを直接クエリ
+    # 2. Sysmon Event ID 3 / 22 から対象PIDのネットワーク接続・DNSイベントを直接クエリ
     xpath = (
-        f"*[System[(EventID=3)] and "
+        f"*[System[(EventID=3 or EventID=22)] and "
         f"EventData[Data[@Name='ProcessId']='{target_pid}']]"
     )
     sysmon_net_events = _query_sysmon_events_readonly(xpath, max_results=20)
@@ -231,9 +231,63 @@ def get_process_network_activity(process_id: int) -> list[dict]:
     return [matched_records[k] for k in sorted_keys]
 
 
+def get_process_related_events(process_id: int) -> list[dict]:
+    """指定されたプロセスID (ProcessId / SourceProcessId / TargetProcessId) に関連する
+    スレッド注入 (ID 8)、プロセスメモリアクセス (ID 10)、ファイル作成 (ID 11)、
+    レジストリ変更 (ID 12/13)、DNSクエリ (ID 22) の履歴を取得します。
+
+    一連の攻撃チェーン（ファイル投下→レジストリ永続化→インジェクション/LSASSアクセス）を
+    相関分析するために使用する完全読み取り専用ツールです。
+
+    Args:
+        process_id: 調査対象プロセスのプロセスID (PID, 整数値)。
+
+    Returns:
+        list[dict]: 関連する Sysmon イベント（最大20件）のトークン最適化済み辞書リスト。
+    """
+    try:
+        target_pid = int(process_id)
+    except (TypeError, ValueError):
+        return []
+
+    logger.info("[Tool Call] get_process_related_events(process_id=%d) を実行中...", target_pid)
+
+    related_ids = (8, 10, 11, 12, 13, 14, 22)
+    matched_records: dict[int, dict[str, Any]] = {}
+    target_pid_str = str(target_pid)
+
+    for ev in get_cached_events():
+        if ev.event_id not in related_ids:
+            continue
+        is_target_match = (
+            ev.process_id == target_pid
+            or ev.event_details.get("target_pid") == target_pid_str
+        )
+        if is_target_match:
+            matched_records[ev.event_record_id] = ev.to_trimmed_dict()
+
+    xpath = (
+        "*[System[(EventID=8 or EventID=10 or EventID=11 or EventID=12 or EventID=13 or EventID=22)] and "
+        f"EventData[(Data[@Name='ProcessId']='{target_pid}' or "
+        f"Data[@Name='SourceProcessId']='{target_pid}' or "
+        f"Data[@Name='TargetProcessId']='{target_pid}')]]"
+    )
+    queried_events = _query_sysmon_events_readonly(xpath, max_results=20)
+    for ev in queried_events:
+        matched_records[ev.event_record_id] = ev.to_trimmed_dict()
+
+    sorted_keys = sorted(matched_records.keys(), reverse=True)[:20]
+    return [matched_records[k] for k in sorted_keys]
+
+
 # Gemini SDK に登録するツール関数リストとディスパッチマップ
-AVAILABLE_TOOLS = [get_parent_process, get_process_network_activity]
+AVAILABLE_TOOLS = [
+    get_parent_process,
+    get_process_network_activity,
+    get_process_related_events,
+]
 TOOL_DISPATCH_MAP = {
     "get_parent_process": get_parent_process,
     "get_process_network_activity": get_process_network_activity,
+    "get_process_related_events": get_process_related_events,
 }

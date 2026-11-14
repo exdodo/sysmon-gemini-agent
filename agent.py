@@ -40,14 +40,14 @@ logger = logging.getLogger("sysmon_gemini_agent.agent")
 
 SYSTEM_INSTRUCTION = """あなたはWindowsセキュリティ監視（SOC）の専門トリアージAIエージェントです。
 ルールベース一次スクリーニングで抽出されたWindowsイベントログ（Sysmon / Security / System）の不審候補について、
-提供されたRead-Onlyツール（`get_parent_process`, `get_process_network_activity`）を必要最小限の回数だけ呼び出して自律調査を行い、最終的なトリアージ判定レポートを日本語のMarkdownで出力してください。
+提供されたRead-Onlyツール（`get_parent_process`, `get_process_network_activity`, `get_process_related_events`）を必要最小限の回数だけ呼び出して自律調査を行い、最終的なトリアージ判定レポートを日本語のMarkdownで出力してください。
 
 【厳守事項】
-1. 調査ループは最大3往復（max_depth = 3）に制限されています。必要な場合のみ `ParentProcessId` から親プロセスを辿るか、`ProcessId` から外部通信（Sysmon ID 3）を確認してください。
+1. 調査ループは最大3往復（max_depth = 3）に制限されています。必要な場合のみ `ParentProcessId` から親プロセスを辿るか、`ProcessId` から外部通信・DNS（Sysmon ID 3/22）や関連挙動（スレッド注入 ID 8、LSASSアクセス ID 10、ファイル作成 ID 11、レジストリ変更 ID 12/13）を確認してください。
 2. 最終回答には必ず以下の3段階の評価レベルのいずれか1つを先頭行または見出しに明記してください:
    - `[CLEAN]` : 正規の管理操作・OS標準動作・誤検知と判断できる場合
    - `[SUSPICIOUS]` : 不審な兆候があるが単独では確定できず、管理者への確認・追加監視が必要な場合
-   - `[CRITICAL]` : 難読化コマンド実行、LOLBin悪用、不審な外部C2通信、権限昇格・侵害の強い兆候、または Sysmon 停止/設定改ざん/ログ消去（EventID 4, 16, 104, 1102, 4719, EventRecordID巻き戻り等）の防衛機能妨害（Defense Evasion）がある場合
+   - `[CRITICAL]` : 難読化コマンド実行、LOLBin悪用、不審な外部C2通信・DNSトンネリング、スレッド注入（ID 8）、LSASSメモリダンプ疑い（ID 10）、危険な永続化（ID 11/12/13）、権限昇格・侵害の強い兆候、または Sysmon 停止/設定改ざん/ログ消去（EventID 4, 16, 104, 1102, 4719, EventRecordID巻き戻り等）の防衛機能妨害（Defense Evasion）がある場合
 3. 最終回答の構成（Markdown形式）:
    - **判定レベル**: `[CLEAN]`, `[SUSPICIOUS]`, `[CRITICAL]` のいずれか
    - **判定理由**: イベント内容およびツール調査結果に基づく具体的な根拠（箇条書き）
@@ -69,7 +69,22 @@ class GeminiTriageAgent:
         model_name: str = config.GEMINI_MODEL,
         max_depth: int = config.MAX_DEPTH,
         alerts_dir: Path = config.ALERTS_DIR,
+        offline_only: bool = False,
     ) -> None:
+        self.offline_only: bool = offline_only
+        self._api_offline_until: float = 0.0
+        self.max_depth: int = min(max(int(max_depth), 1), 3)
+        self.alerts_dir: Path = alerts_dir
+        self.alerts_dir.mkdir(parents=True, exist_ok=True)
+        self._last_model_refresh_ts: float = 0.0
+
+        if self.offline_only:
+            self.client = None
+            self.auto_model_enabled = False
+            self.model_name = "offline-rule-engine"
+            logger.info("オフライン専用モードで初期化しました（Gemini API無効・一次ルール即時フォールバック有効）。")
+            return
+
         if not HAS_GOOGLE_GENAI or genai is None:
             raise ImportError(
                 "公式SDK 'google-genai' がインストールされていません。"
@@ -90,10 +105,6 @@ class GeminiTriageAgent:
         self.model_name: str = (
             config.DEFAULT_FALLBACK_MODEL if self.auto_model_enabled else requested_model
         )
-        self._last_model_refresh_ts: float = 0.0
-        self.max_depth: int = min(max(int(max_depth), 1), 3)
-        self.alerts_dir: Path = alerts_dir
-        self.alerts_dir.mkdir(parents=True, exist_ok=True)
 
         if self.auto_model_enabled:
             self.refresh_latest_model(force=True)
@@ -176,8 +187,8 @@ class GeminiTriageAgent:
 
         return (
             "以下のWindowsイベントがルールベース一次スクリーニングで「不審候補」として検出されました。\n"
-            "必要に応じてツール（`get_parent_process`, `get_process_network_activity`）を呼び出して"
-            "親プロセスや外部通信の有無を確認し、トリアージ判定を行ってください。\n\n"
+            "必要に応じてツール（`get_parent_process`, `get_process_network_activity`, `get_process_related_events`）を呼び出して"
+            "親プロセスや外部通信・DNS・注入/永続化挙動の有無を確認し、トリアージ判定を行ってください。\n\n"
             f"### メタ情報\n"
             f"- Channel: `{event.channel}`\n"
             f"- EventID: `{event.event_id}`\n"
@@ -458,11 +469,126 @@ class GeminiTriageAgent:
         report_text = (response.text or "").strip()
         return report_text, depth, tool_trace
 
+    @staticmethod
+    def classify_offline_severity(event: NormalizedEvent) -> str:
+        """
+        Gemini API が利用できない環境・障害時に、一次スクリーニング理由とイベント内容から
+        ローカルルールのみで `[CRITICAL]` または `[SUSPICIOUS]` を即時判定します。
+        """
+        reasons_joined = " ".join(event.screening_reasons)
+        reasons_lower = reasons_joined.lower()
+        cmd_lower = (event.command_line or "").lower()
+
+        if "[critical候補]" in reasons_lower:
+            return config.SEVERITY_CRITICAL
+
+        high_risk_tokens = (
+            "mimikatz",
+            "sekurlsa",
+            "vssadmin",
+            "wevtutil",
+            "fltmc",
+            "sysmondrv",
+            "clear-winevent",
+            "clear-eventlog",
+            "auditpol",
+            "evtclearlog",
+            "sysmon のアンインストール",
+            "-enc",
+            "encodedcommand",
+            "frombase64string",
+            "downloadstring",
+            "iex",
+            "invoke-expression",
+            "mshta",
+            "certutil -urlcache",
+            "certutil.exe -urlcache",
+        )
+        if any(tok in reasons_lower or tok in cmd_lower for tok in high_risk_tokens):
+            return config.SEVERITY_CRITICAL
+
+        if (
+            event.event_id == 3
+            and event.destination_ip not in ("", "-", "127.0.0.1", "::1", "0.0.0.0")
+            and any(tp.lower() in (event.image or "").lower() for tp in config.SUSPICIOUS_TEMP_PATHS)
+        ):
+            return config.SEVERITY_CRITICAL
+
+        return config.SEVERITY_SUSPICIOUS
+
+    def investigate_offline(
+        self,
+        event: NormalizedEvent,
+        error_reason: str = "",
+    ) -> dict[str, Any]:
+        """
+        オフライン専用モードまたは Gemini API 通信障害時のフォールバックトリアージを実行し、
+        ローカル判定・レポート出力・CRITICAL時の通知/迎撃ダイアログ連携を継続します。
+        """
+        severity = self.classify_offline_severity(event)
+        mode_note = (
+            "オフライン専用モード (`--offline`)"
+            if self.offline_only
+            else f"Gemini API 障害時ローカルフォールバック (理由: {error_reason or '通信不可'})"
+        )
+        reasons_md = "\n".join(f"  - {r}" for r in event.screening_reasons) or "  - 一次スクリーニング条件一致"
+
+        report_text = (
+            f"{severity}\n"
+            f"- **実行モード**: ⚠️ {mode_note}\n"
+            "- **判定理由**:\n"
+            f"{reasons_md}\n"
+            "- **オフライン補足**: Gemini API への問い合わせが利用できないため、第1層ルールベース検知と"
+            "イベント種別重要度に基づきローカルで緊急判定を実施しました。\n"
+            "- **推奨確認事項**:\n"
+            "  - `alerts/incident_YYYYMMDD.md` 内の対象プロセス・コマンドライン・通信先を確認してください。\n"
+            "  - `[CRITICAL]` 判定時は Microsoft Defender ローカルスキャン結果および迎撃パネルで生存確認を行ってください。\n"
+            "  - ネットワーク/API障害がマルウェアによる意図的な通信遮断でないか（ファイアウォール/HOSTS設定等）も確認してください。"
+        )
+        model_label = (
+            "offline-rule-engine"
+            if self.offline_only
+            else f"offline-rule-fallback (待機中AI: {self.model_name})"
+        )
+        report_file = self.append_triage_report(
+            event=event,
+            severity=severity,
+            report_text=report_text,
+            tool_trace=[],
+            model_label=model_label,
+        )
+        logger.warning(
+            "ローカルルールによるフォールバック判定を実行しました: EventID=%d, RecordID=%d -> %s",
+            event.event_id,
+            event.event_record_id,
+            severity,
+        )
+        return {
+            "severity": severity,
+            "depth_used": 0,
+            "tool_trace": [],
+            "report_text": report_text,
+            "report_file": str(report_file),
+            "offline_fallback": True,
+            "fallback_error": error_reason,
+        }
+
     def investigate_event(self, event: NormalizedEvent) -> dict[str, Any]:
         """
         単一の不審候補イベントに対して Gemini Function Calling ループを実行します。
         `max_depth = 3` を厳格に適用し、最大3往復で必ず調査を打ち切ってレポートを生成します。
+        オフライン環境や API 障害時は、ローカルルールによるフォールバック判定へ自動切替します。
         """
+        if self.offline_only or self.client is None:
+            return self.investigate_offline(event, error_reason="オフライン専用モード")
+
+        now_mono = time.monotonic()
+        if now_mono < self._api_offline_until:
+            return self.investigate_offline(
+                event,
+                error_reason="Gemini API 一時停止中のためローカルフォールバック継続",
+            )
+
         if self.auto_model_enabled:
             self.refresh_latest_model(force=False)
 
@@ -491,19 +617,30 @@ class GeminiTriageAgent:
         depth = 0
         tool_trace: list[dict[str, Any]] = []
 
-        for attempt_idx in range(max_fallback_attempts + 1):
-            tried_models.add(self.model_name)
-            try:
-                report_text, depth, tool_trace = self._run_chat_triage_loop(prompt, base_config)
-                break
-            except APIError as api_err:
-                if (
-                    attempt_idx < max_fallback_attempts
-                    and self._is_model_unavailable_error(api_err)
-                    and self._switch_to_fallback_model(str(api_err), tried_models=tried_models)
-                ):
-                    continue
-                raise
+        try:
+            for attempt_idx in range(max_fallback_attempts + 1):
+                tried_models.add(self.model_name)
+                try:
+                    report_text, depth, tool_trace = self._run_chat_triage_loop(prompt, base_config)
+                    self._api_offline_until = 0.0
+                    break
+                except APIError as api_err:
+                    if (
+                        attempt_idx < max_fallback_attempts
+                        and self._is_model_unavailable_error(api_err)
+                        and self._switch_to_fallback_model(str(api_err), tried_models=tried_models)
+                    ):
+                        continue
+                    raise
+        except Exception as triage_exc:
+            self._api_offline_until = time.monotonic() + config.API_OFFLINE_COOLDOWN_SECONDS
+            logger.error(
+                "Gemini API 調査に失敗したため、ローカルルールへフォールバックします (%d秒間待機): %s",
+                config.API_OFFLINE_COOLDOWN_SECONDS,
+                triage_exc,
+            )
+            return self.investigate_offline(event, error_reason=str(triage_exc))
+
         if not report_text:
             report_text = (
                 f"{config.SEVERITY_SUSPICIOUS}\n"
@@ -525,6 +662,7 @@ class GeminiTriageAgent:
             "tool_trace": tool_trace,
             "report_text": report_text,
             "report_file": str(report_file),
+            "offline_fallback": False,
         }
 
     def append_triage_report(
@@ -533,6 +671,7 @@ class GeminiTriageAgent:
         severity: str,
         report_text: str,
         tool_trace: list[dict[str, Any]],
+        model_label: str | None = None,
     ) -> Path:
         """
         【第3層: トリアージ・レポート出力】
@@ -548,6 +687,7 @@ class GeminiTriageAgent:
         trimmed = event.to_trimmed_dict()
         reasons_md = "\n".join(f"  - {r}" for r in event.screening_reasons) or "  - 一次フィルタ一致"
         proc_check = verify_target_process(event.process_id, event.image, event.utc_time)
+        used_model = model_label or self.model_name
 
         if tool_trace:
             trace_lines = []
@@ -563,7 +703,7 @@ class GeminiTriageAgent:
             f"\n---\n\n"
             f"## {severity} インシデント・トリアージレポート ({timestamp_str})\n\n"
             f"- **評価レベル**: **{severity}**\n"
-            f"- **使用AIモデル**: `{self.model_name}`\n"
+            f"- **使用AIモデル**: `{used_model}`\n"
             f"- **監視チャネル**: `{event.channel}` (Event ID: `{event.event_id}`, Record ID: `{event.event_record_id}`)\n"
             f"- **イベント発生時刻 (UTC)**: `{trimmed['UtcTime']}`\n"
             f"- **対象プロセス**: `{trimmed['Image']}` (PID: `{trimmed['ProcessId']}`)\n"

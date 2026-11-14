@@ -13,7 +13,7 @@ from pathlib import Path
 # ============================================================================
 # アプリケーションバージョン定義 (機能追加時に更新し、CHANGELOG.md / Gitタグと同期)
 # ============================================================================
-APP_VERSION: str = "1.00"
+APP_VERSION: str = "1.10"
 
 # ============================================================================
 # パス設定 (ワークスペース内に閉じた設計・親ディレクトリへのアクセス禁止)
@@ -28,8 +28,8 @@ AGENT_LOG_FILE: Path = ALERTS_DIR / "agent_runtime.log"
 # ============================================================================
 # 早期検知のため 15 秒間隔で巡回（一次フィルタにより通常時のAPI消費はゼロ）
 POLL_INTERVAL_SECONDS: int = 15
-MAX_EVENTS_PER_POLL: int = 500
-RECENT_EVENT_CACHE_SIZE: int = 2000
+MAX_EVENTS_PER_POLL: int = 1000
+RECENT_EVENT_CACHE_SIZE: int = 4000
 
 # 監視対象チャネルおよび対象 Event ID
 SYSMON_CHANNEL: str = "Microsoft-Windows-Sysmon/Operational"
@@ -40,7 +40,13 @@ SYSMON_EVENT_IDS: set[int] = {
     1,    # Process Creation (プロセス生成)
     3,    # Network Connection (ネットワーク接続)
     4,    # Sysmon Service State Changed (Sysmonサービス停止・状態変化)
+    8,    # CreateRemoteThread (スレッド注入 / DLLインジェクション検知)
+    10,   # ProcessAccess (LSASSメモリダンプ・他プロセスへの高権限アクセス検知)
+    11,   # FileCreate (スタートアップ・不審フォルダへの実行ファイル/スクリプト生成検知)
+    12,   # RegistryEvent (Object create/delete: 永続化・セキュリティ設定変更)
+    13,   # RegistryEvent (Value Set: 永続化・IFEO・Defender無効化等の値書換)
     16,   # Sysmon Config State Changed (Sysmon設定変更・改ざん検知)
+    22,   # DNSEvent (DNSクエリ・C2/LOLBin名前解決・DNSトンネリング検知)
     255,  # Sysmon Error (Sysmonドライバ・エラー報告)
 }
 
@@ -104,11 +110,11 @@ SUSPICIOUS_KEYWORDS: tuple[str, ...] = (
 
 # 一時ディレクトリ等の不審な実行元パスパターン (小文字で比較)
 SUSPICIOUS_TEMP_PATHS: tuple[str, ...] = (
-    r"\appdata\local\temp\\",
-    r"\appdata\roaming\\",
-    r"\windows\temp\\",
-    r"\users\public\\",
-    r"\programdata\\",
+    "\\appdata\\local\\temp\\",
+    "\\appdata\\roaming\\",
+    "\\windows\\temp\\",
+    "\\users\\public\\",
+    "\\programdata\\",
 )
 
 # 一時ディレクトリから起動された際に警戒する拡張子
@@ -128,7 +134,7 @@ SUSPICIOUS_EXTENSIONS: tuple[str, ...] = (
     ".msi",
 )
 
-# 外部通信 (Sysmon Event ID 3) で一次スクリーニング対象とする不審プロセス名 (小文字)
+# 外部通信 (Sysmon Event ID 3 / 22) で一次スクリーニング対象とする不審プロセス名 (小文字)
 SUSPICIOUS_NETWORK_IMAGES: tuple[str, ...] = (
     "powershell.exe",
     "pwsh.exe",
@@ -140,8 +146,131 @@ SUSPICIOUS_NETWORK_IMAGES: tuple[str, ...] = (
     "wscript.exe",
     "cscript.exe",
     "bitsadmin.exe",
+    "curl.exe",
     "notepad.exe",
     "calc.exe",
+)
+
+# ============================================================================
+# 拡張 Sysmon イベント (ID 8, 10, 11, 12, 13, 22) 一次スクリーニング定義
+# ============================================================================
+# スレッド注入・プロセスアクセス時に特に警戒する標的プロセス名 (小文字)
+HIGH_RISK_TARGET_PROCESSES: frozenset[str] = frozenset(
+    {
+        "lsass.exe",
+        "winlogon.exe",
+        "services.exe",
+        "svchost.exe",
+        "explorer.exe",
+        "spoolsv.exe",
+        "notepad.exe",
+        "calc.exe",
+    }
+)
+
+# CreateRemoteThread (ID 8) 等でOS標準挙動として除外する信頼済みシステムプロセス名 (小文字)
+TRUSTED_SYSTEM_INJECTOR_NAMES: frozenset[str] = frozenset(
+    {
+        "csrss.exe",
+        "smss.exe",
+        "wininit.exe",
+        "services.exe",
+        "svchost.exe",
+        "msmpeng.exe",
+        "nissrv.exe",
+    }
+)
+
+# FileCreate (ID 11) でファイル投下元として警戒するLOLBin・Office系プロセス名 (小文字)
+DROPPER_SOURCE_IMAGES: frozenset[str] = frozenset(
+    {
+        "winword.exe",
+        "excel.exe",
+        "powerpnt.exe",
+        "outlook.exe",
+        "onenote.exe",
+        "mshta.exe",
+        "wscript.exe",
+        "cscript.exe",
+        "rundll32.exe",
+        "regsvr32.exe",
+        "certutil.exe",
+        "bitsadmin.exe",
+        "powershell.exe",
+        "pwsh.exe",
+        "cmd.exe",
+        "curl.exe",
+    }
+)
+
+# FileCreate (ID 11) で永続化・ステージング先として強く警戒するディレクトリパターン (小文字)
+PERSISTENCE_FILE_PATHS: tuple[str, ...] = (
+    "\\microsoft\\windows\\start menu\\programs\\startup\\",
+    "\\windows\\system32\\tasks\\",
+    "\\windows\\tasks\\",
+)
+
+# FileCreate (ID 11) でランサムノートとして検知するファイル名パターン (小文字)
+RANSOMWARE_NOTE_PATTERNS: tuple[str, ...] = (
+    "readme_for_decrypt",
+    "how_to_decrypt",
+    "decrypt_instruction",
+    "recover_files",
+    "_readme.txt",
+    "restore_files",
+)
+
+# RegistryEvent (ID 12 / 13) で永続化・セキュリティ無効化として警戒するキーパス (小文字)
+CRITICAL_REGISTRY_PATHS: tuple[str, ...] = (
+    "\\services\\sysmon",
+    "\\services\\eventlog",
+    "\\services\\windefend",
+    "\\policies\\microsoft\\windows defender",
+    "\\image file execution options\\",
+    "\\appinit_dlls",
+    "\\winlogon\\shell",
+    "\\winlogon\\userinit",
+    "\\winlogon\\notify",
+    "\\control\\lsa\\",
+    "\\classes\\mscfile\\shell\\open\\command",
+    "\\classes\\ms-settings\\shell\\open\\command",
+)
+
+PERSISTENCE_REGISTRY_PATHS: tuple[str, ...] = (
+    r"\currentversion\run",
+    r"\user shell folders\startup",
+    r"\shell folders\startup",
+)
+
+# DNSEvent (ID 22) で特に警戒する外部ドメイン・ダイナミックDNS・トンネリング関連パターン (小文字)
+SUSPICIOUS_DNS_DOMAINS: tuple[str, ...] = (
+    ".onion",
+    "pastebin.com",
+    "raw.githubusercontent.com",
+    "ngrok.io",
+    "ngrok-free.app",
+    "trycloudflare.com",
+    "duckdns.org",
+    "no-ip.com",
+    "ddns.net",
+    "interact.sh",
+    "burpcollaborator.net",
+)
+
+# DNSトンネリング判定で誤検知を防ぐための既知CDN/クラウド親ドメイン末尾 (小文字)
+BENIGN_LONG_DNS_SUFFIXES: tuple[str, ...] = (
+    ".amazonaws.com",
+    ".cloudfront.net",
+    ".akamaiedge.net",
+    ".akadns.net",
+    ".azureedge.net",
+    ".trafficmanager.net",
+    ".microsoft.com",
+    ".office.com",
+    ".windowsupdate.com",
+    ".googleapis.com",
+    ".google.com",
+    ".1e100.net",
 )
 
 # ============================================================================
@@ -189,6 +318,9 @@ MAX_API_RETRIES: int = 4
 INITIAL_BACKOFF_SECONDS: float = 2.0
 BACKOFF_MULTIPLIER: float = 2.0
 MAX_BACKOFF_SECONDS: float = 30.0
+
+# オフライン・API障害時に連続リトライ遅延を防ぐサーキットブレーカー再試行クールダウン（秒）
+API_OFFLINE_COOLDOWN_SECONDS: int = 60
 
 # ============================================================================
 # 第3層: トリアージ評価レベル定義

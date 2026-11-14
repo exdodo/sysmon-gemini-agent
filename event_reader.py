@@ -13,6 +13,7 @@ from dataclasses import dataclass, field
 from datetime import datetime, timezone
 import json
 import logging
+import os
 from pathlib import Path
 import re
 import time
@@ -75,6 +76,7 @@ class NormalizedEvent:
     logon_type: str = ""
     status_code: str = ""
     screening_reasons: list[str] = field(default_factory=list)
+    event_details: dict[str, str] = field(default_factory=dict)
 
     def to_trimmed_dict(self) -> dict[str, Any]:
         """
@@ -105,6 +107,22 @@ def register_event_in_cache(event: NormalizedEvent) -> None:
 def get_cached_events() -> list[NormalizedEvent]:
     """インメモリキャッシュ内のイベント一覧（新しい順）を返します。"""
     return list(reversed(_RECENT_EVENTS))
+
+
+def _extract_first_ip_from_dns_results(query_results: str) -> str:
+    """Sysmon Event ID 22 の QueryResults 文字列から先頭の IP アドレスを抽出します。"""
+    if not query_results:
+        return ""
+    for token in query_results.split(";"):
+        part = token.strip()
+        if not part or part.startswith("type:"):
+            continue
+        if part.lower().startswith("::ffff:"):
+            part = part[7:]
+        # IPv4 または IPv6 形式の簡易検証
+        if re.match(r"^\d{1,3}(?:\.\d{1,3}){3}$", part) or ":" in part:
+            return part
+    return ""
 
 
 def _parse_int(value: str | None) -> int | None:
@@ -185,8 +203,10 @@ def parse_event_xml(xml_text: str, default_channel: str = "") -> NormalizedEvent
 
     # UtcTime: EventData 側の UtcTime を優先し、無ければ System.TimeCreated を使用
     utc_time = event_data.get("UtcTime") or utc_time
+    extracted_details: dict[str, str] = {}
+    parsed_dest_ip = ""
 
-    # Sysmon Event ID 1 / 3 / 4 / 16 / 255 および Security / System 監査イベントの正規化
+    # Sysmon Event ID 1/3/4/8/10/11/12/13/14/16/22/255 および Security / System 監査イベントの正規化
     if event_id == 4688:
         # Windows Security 4688 では NewProcessId が生成されたプロセス、ProcessId が親プロセス
         process_id = _parse_int(event_data.get("NewProcessId"))
@@ -219,6 +239,86 @@ def parse_event_xml(xml_text: str, default_channel: str = "") -> NormalizedEvent
         parent_image = ""
         command_line = f"Sysmon Service State Changed: State={state} Version={version}".strip()
         parent_command_line = ""
+    elif channel == config.SYSMON_CHANNEL and event_id == 8:
+        # Sysmon Event ID 8: CreateRemoteThread (スレッド注入 / DLLインジェクション)
+        process_id = _parse_int(event_data.get("SourceProcessId"))
+        parent_process_id = None
+        image = event_data.get("SourceImage", "")
+        parent_image = ""
+        tgt_pid = event_data.get("TargetProcessId", "")
+        tgt_image = event_data.get("TargetImage", "")
+        start_addr = event_data.get("StartAddress", "")
+        start_mod = event_data.get("StartModule", "")
+        start_fn = event_data.get("StartFunction", "")
+        command_line = (
+            f"CreateRemoteThread (ID=8): Target={tgt_image} (TargetPID={tgt_pid}) "
+            f"StartAddress={start_addr} StartModule={start_mod} StartFunction={start_fn}"
+        ).strip()
+        parent_command_line = ""
+        extracted_details = {
+            "target_image": tgt_image,
+            "target_pid": tgt_pid,
+            "start_address": start_addr,
+            "start_module": start_mod,
+            "start_function": start_fn,
+        }
+    elif channel == config.SYSMON_CHANNEL and event_id == 10:
+        # Sysmon Event ID 10: ProcessAccess (LSASSメモリダンプ・不正プロセスメモリアクセス)
+        process_id = _parse_int(event_data.get("SourceProcessId"))
+        parent_process_id = None
+        image = event_data.get("SourceImage", "")
+        parent_image = ""
+        tgt_pid = event_data.get("TargetProcessId", "")
+        tgt_image = event_data.get("TargetImage", "")
+        granted_access = event_data.get("GrantedAccess", "")
+        call_trace = event_data.get("CallTrace", "")
+        call_trace_short = call_trace[:220] + ("..." if len(call_trace) > 220 else "")
+        command_line = (
+            f"ProcessAccess (ID=10): Target={tgt_image} (TargetPID={tgt_pid}) "
+            f"GrantedAccess={granted_access} CallTrace={call_trace_short}"
+        ).strip()
+        parent_command_line = ""
+        extracted_details = {
+            "target_image": tgt_image,
+            "target_pid": tgt_pid,
+            "granted_access": granted_access,
+            "call_trace": call_trace,
+        }
+    elif channel == config.SYSMON_CHANNEL and event_id == 11:
+        # Sysmon Event ID 11: FileCreate (ファイル作成)
+        process_id = _parse_int(event_data.get("ProcessId"))
+        parent_process_id = None
+        image = event_data.get("Image", "")
+        parent_image = ""
+        target_filename = event_data.get("TargetFilename", "")
+        creation_utc = event_data.get("CreationUtcTime", "")
+        command_line = (
+            f"FileCreate (ID=11): TargetFilename={target_filename} (Created={creation_utc})"
+        ).strip()
+        parent_command_line = ""
+        extracted_details = {
+            "target_filename": target_filename,
+            "creation_utc_time": creation_utc,
+        }
+    elif channel == config.SYSMON_CHANNEL and event_id in (12, 13, 14):
+        # Sysmon Event ID 12/13/14: RegistryEvent (レジストリ変更・永続化)
+        process_id = _parse_int(event_data.get("ProcessId"))
+        parent_process_id = None
+        image = event_data.get("Image", "")
+        parent_image = ""
+        evt_type = event_data.get("EventType", "")
+        target_object = event_data.get("TargetObject", "")
+        details = event_data.get("Details", "") or event_data.get("NewName", "")
+        command_line = (
+            f"RegistryEvent (ID={event_id}, Type={evt_type}): "
+            f"TargetObject={target_object} Details={details}"
+        ).strip()
+        parent_command_line = ""
+        extracted_details = {
+            "event_type": evt_type,
+            "target_object": target_object,
+            "details": details,
+        }
     elif channel == config.SYSMON_CHANNEL and event_id == 16:
         # Sysmon Event ID 16: Sysmon config state changed
         process_id = None
@@ -231,6 +331,26 @@ def parse_event_xml(xml_text: str, default_channel: str = "") -> NormalizedEvent
             f"Sysmon Config Changed: Configuration={cfg_path} Hash={cfg_hash}"
         ).strip()
         parent_command_line = ""
+    elif channel == config.SYSMON_CHANNEL and event_id == 22:
+        # Sysmon Event ID 22: DNSEvent (DNSクエリ)
+        process_id = _parse_int(event_data.get("ProcessId"))
+        parent_process_id = None
+        image = event_data.get("Image", "")
+        parent_image = ""
+        query_name = event_data.get("QueryName", "")
+        query_status = event_data.get("QueryStatus", "")
+        query_results = event_data.get("QueryResults", "")
+        parsed_dest_ip = _extract_first_ip_from_dns_results(query_results)
+        results_short = query_results[:180] + ("..." if len(query_results) > 180 else "")
+        command_line = (
+            f"DNSEvent (ID=22): QueryName={query_name} Status={query_status} Results={results_short}"
+        ).strip()
+        parent_command_line = ""
+        extracted_details = {
+            "query_name": query_name,
+            "query_status": query_status,
+            "query_results": query_results,
+        }
     elif channel == config.SYSMON_CHANNEL and event_id == 255:
         # Sysmon Event ID 255: Error report
         process_id = None
@@ -295,6 +415,7 @@ def parse_event_xml(xml_text: str, default_channel: str = "") -> NormalizedEvent
     destination_ip = (
         event_data.get("DestinationIp")
         or event_data.get("IpAddress")
+        or parsed_dest_ip
         or ""
     )
     if destination_ip in ("-", "::1", "127.0.0.1"):
@@ -321,8 +442,211 @@ def parse_event_xml(xml_text: str, default_channel: str = "") -> NormalizedEvent
         user=event_data.get("User") or event_data.get("TargetUserName") or "",
         logon_type=event_data.get("LogonType", ""),
         status_code=event_data.get("Status", ""),
+        event_details=extracted_details,
     )
     return normalized
+
+
+def _image_basename(path: str) -> str:
+    """実行ファイルパスから小文字のベース名を取得します。"""
+    return (path or "").replace("/", "\\").rsplit("\\", 1)[-1].lower()
+
+
+def _screen_create_remote_thread(event: NormalizedEvent, reasons: list[str]) -> None:
+    """Sysmon Event ID 8 (CreateRemoteThread) のスレッド注入判定を行います。"""
+    tgt_img = event.event_details.get("target_image", "")
+    src_base = _image_basename(event.image)
+    tgt_base = _image_basename(tgt_img)
+    start_mod = (event.event_details.get("start_module") or "").strip().lower()
+    src_lower = (event.image or "").lower()
+
+    if src_base and src_base == tgt_base:
+        return
+
+    is_trusted_src = src_base in config.TRUSTED_SYSTEM_INJECTOR_NAMES
+    if is_trusted_src and start_mod and tgt_base != "lsass.exe":
+        return
+
+    if not start_mod or (
+        start_mod and not start_mod.endswith((".dll", ".exe", ".sys", ".ocx"))
+    ):
+        reasons.append(
+            f"[CRITICAL候補] モジュール裏付けのないスレッド注入疑い (CreateRemoteThread: "
+            f"{event.image} -> {tgt_img}, StartAddress={event.event_details.get('start_address', '')})"
+        )
+    elif (
+        tgt_base in config.HIGH_RISK_TARGET_PROCESSES
+        or src_base in config.DROPPER_SOURCE_IMAGES
+        or any(tp.lower() in src_lower for tp in config.SUSPICIOUS_TEMP_PATHS)
+    ):
+        reasons.append(
+            f"[CRITICAL候補] 他プロセスへのスレッド注入 (CreateRemoteThread: {event.image} -> {tgt_img})"
+        )
+
+
+def _screen_process_access(event: NormalizedEvent, reasons: list[str]) -> None:
+    """Sysmon Event ID 10 (ProcessAccess) のLSASSメモリダンプ・不正メモリ書込判定を行います。"""
+    tgt_img = event.event_details.get("target_image", "")
+    src_base = _image_basename(event.image)
+    tgt_base = _image_basename(tgt_img)
+    src_lower = (event.image or "").lower()
+    granted_str = event.event_details.get("granted_access", "")
+    granted_mask = _parse_int(granted_str) or 0
+    call_trace_lower = (event.event_details.get("call_trace") or "").lower()
+
+    # 監視エージェント自身のプロセス照会 (PROCESS_QUERY系) は除外
+    if event.process_id in (os.getpid(), os.getppid()) and tgt_base != "lsass.exe":
+        return
+
+    has_vm_read = bool(granted_mask & 0x0010)
+    has_vm_write_or_op = bool(granted_mask & 0x0028)
+    has_unbacked_calltrace = "unknown" in call_trace_lower
+
+    if tgt_base == "lsass.exe" and (has_vm_read or has_vm_write_or_op):
+        is_trusted_core = (
+            src_base in ("csrss.exe", "wininit.exe", "smss.exe", "services.exe", "lsass.exe", "svchost.exe")
+            and src_lower.startswith("c:\\windows\\system32\\")
+        )
+        is_trusted_defender = (
+            src_base in ("msmpeng.exe", "nissrv.exe") and "\\windows defender\\" in src_lower
+        )
+        if (not is_trusted_core and not is_trusted_defender) or has_unbacked_calltrace:
+            reasons.append(
+                f"[CRITICAL候補] LSASS プロセスメモリへの高権限アクセス (認証情報ダンプ疑い: "
+                f"{event.image}, GrantedAccess={granted_str})"
+            )
+    elif (
+        has_vm_write_or_op
+        and src_base != tgt_base
+        and tgt_base in config.HIGH_RISK_TARGET_PROCESSES
+        and (
+            src_base in config.DROPPER_SOURCE_IMAGES
+            or any(tp.lower() in src_lower for tp in config.SUSPICIOUS_TEMP_PATHS)
+            or has_unbacked_calltrace
+        )
+    ):
+        reasons.append(
+            f"[CRITICAL候補] 他プロセスへのメモリ書込権限取得 ({event.image} -> {tgt_img}, GrantedAccess={granted_str})"
+        )
+
+
+def _screen_file_create(event: NormalizedEvent, reasons: list[str]) -> None:
+    """Sysmon Event ID 11 (FileCreate) の永続化投下・不審スクリプト作成・ランサム兆候を判定します。"""
+    target_file = event.event_details.get("target_filename", "")
+    if not target_file:
+        return
+    target_lower = target_file.lower()
+    target_name = _image_basename(target_file)
+    src_base = _image_basename(event.image)
+
+    if any(pat in target_name for pat in config.RANSOMWARE_NOTE_PATTERNS):
+        reasons.append(f"[CRITICAL候補] ランサムノート疑いのファイル作成を検知 ({target_file})")
+        return
+
+    is_exec_or_script = any(target_lower.endswith(ext) for ext in config.SUSPICIOUS_EXTENSIONS) or target_lower.endswith(".lnk")
+    if not is_exec_or_script:
+        return
+
+    if any(p.lower() in target_lower for p in config.PERSISTENCE_FILE_PATHS):
+        reasons.append(
+            f"[CRITICAL候補] スタートアップ/タスク領域への実行ファイル・スクリプト投下 ({target_file})"
+        )
+        return
+
+    if any(p in target_lower for p in ("\\users\\public\\", "\\windows\\temp\\")):
+        reasons.append(
+            f"公開/システム一時フォルダへの実行ファイル・スクリプト作成 ({event.image} -> {target_file})"
+        )
+        return
+
+    if src_base in config.DROPPER_SOURCE_IMAGES and any(
+        tp.lower() in target_lower for tp in config.SUSPICIOUS_TEMP_PATHS
+    ):
+        reasons.append(
+            f"Office/LOLBin ({src_base}) による一時領域への実行ファイル・スクリプト投下 ({target_file})"
+        )
+
+
+def _screen_registry_event(event: NormalizedEvent, reasons: list[str]) -> None:
+    """Sysmon Event ID 12/13/14 (RegistryEvent) の永続化・防衛機能無効化を判定します。"""
+    target_obj = event.event_details.get("target_object", "")
+    details = event.event_details.get("details", "")
+    if not target_obj:
+        return
+    target_lower = target_obj.lower()
+    details_lower = details.lower()
+    src_base = _image_basename(event.image)
+
+    if any(path_pat in target_lower for path_pat in config.CRITICAL_REGISTRY_PATHS):
+        reasons.append(
+            f"[CRITICAL候補] 防衛機能妨害または高危険度永続化レジストリ変更 ({target_obj})"
+        )
+        return
+
+    if any(path_pat in target_lower for path_pat in config.PERSISTENCE_REGISTRY_PATHS):
+        is_suspicious_val = (
+            any(tp.lower() in details_lower for tp in config.SUSPICIOUS_TEMP_PATHS)
+            or any(kw.lower() in details_lower for kw in config.SUSPICIOUS_KEYWORDS)
+            or src_base in config.DROPPER_SOURCE_IMAGES
+            or src_base == "reg.exe"
+        )
+        if is_suspicious_val:
+            reasons.append(
+                f"レジストリ自動起動 (Run/Startup) への不審な永続化登録 ({target_obj} -> {details})"
+            )
+
+
+def _screen_dns_event(event: NormalizedEvent, reasons: list[str]) -> None:
+    """Sysmon Event ID 22 (DNSEvent) の不審名前解決・DNSトンネリングを判定します。"""
+    qname = (event.event_details.get("query_name") or "").strip()
+    if not qname:
+        return
+    q_lower = qname.lower().rstrip(".")
+    if q_lower in ("localhost", "wpad") or q_lower.endswith((".local", ".arpa", ".lan", ".home")):
+        return
+
+    src_base = _image_basename(event.image)
+    src_lower = (event.image or "").lower()
+    is_lolbin_or_temp = (
+        src_base in config.SUSPICIOUS_NETWORK_IMAGES
+        or any(p in src_lower for p in ("\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\users\\public\\"))
+    )
+
+    # 1. ダイナミックDNS・C2悪用・トンネル系ドメイン
+    high_risk_dns = (
+        ".onion",
+        "ngrok.io",
+        "ngrok-free.app",
+        "trycloudflare.com",
+        "duckdns.org",
+        "no-ip.com",
+        "ddns.net",
+        "interact.sh",
+        "burpcollaborator.net",
+    )
+    if any(dom in q_lower for dom in high_risk_dns):
+        reasons.append(f"不審/ダイナミックDNSドメインへの名前解決 ({event.image} -> {qname})")
+        return
+
+    if is_lolbin_or_temp and any(dom in q_lower for dom in config.SUSPICIOUS_DNS_DOMAINS):
+        reasons.append(f"LOLBin/一時ディレクトリプロセスによる不審ドメイン参照 ({event.image} -> {qname})")
+        return
+
+    # 2. LOLBin / スクリプトホストによる外部名前解決
+    if src_base in config.SUSPICIOUS_NETWORK_IMAGES:
+        reasons.append(f"LOLBin/スクリプトホスト ({src_base}) によるDNS名前解決 ({qname})")
+        return
+
+    # 3. 高リスク一時ディレクトリ上のプロセスによる外部名前解決
+    if any(p in src_lower for p in ("\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\users\\public\\")):
+        reasons.append(f"一時・公開フォルダ上のプロセスによるDNS名前解決 ({event.image} -> {qname})")
+        return
+
+    # 4. DNSトンネリング疑いの異常長ラベル/クエリ長
+    if not q_lower.endswith(config.BENIGN_LONG_DNS_SUFFIXES):
+        max_label_len = max((len(lbl) for lbl in q_lower.split(".")), default=0)
+        if max_label_len >= 50 or len(q_lower) >= 100:
+            reasons.append(f"DNSトンネリング疑いの異常長クエリを検知 ({qname})")
 
 
 def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
@@ -337,6 +661,8 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
     4. Security Event ID 4625 (ログオン失敗) のうちリモート・ネットワーク経由の不審試行。
     5. Sysmon改ざん・ログ消去・サービス停止などの Defense Evasion イベント
        (Sysmon 4/16/255, Security 1102/4719, System 104/7036/7040)。
+    6. 拡張Sysmon検知: スレッド注入 (ID 8)、LSASSメモリ読取等 (ID 10)、
+       永続化/不審ファイル作成 (ID 11)、レジストリ永続化/無効化 (ID 12/13)、DNS (ID 22)。
     """
     reasons: list[str] = list(event.screening_reasons)
     cmd_lower = (event.command_line or "").lower()
@@ -358,6 +684,16 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
             reasons.append(
                 f"[CRITICAL候補] Sysmon エラー/異常報告 ({event.command_line})"
             )
+        elif event.event_id == 8:
+            _screen_create_remote_thread(event, reasons)
+        elif event.event_id == 10:
+            _screen_process_access(event, reasons)
+        elif event.event_id == 11:
+            _screen_file_create(event, reasons)
+        elif event.event_id in (12, 13, 14):
+            _screen_registry_event(event, reasons)
+        elif event.event_id == 22:
+            _screen_dns_event(event, reasons)
     elif event.event_id in (1102, 104):
         reasons.append(
             f"[CRITICAL候補] イベントログ消去を検知 (EventID={event.event_id}: {event.command_line})"
@@ -375,36 +711,39 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
                 )
 
     # 条件1: コマンドライン（または親プロセスコマンドライン）の不審キーワード・Sysmon CLI改ざん検査
-    if _SYSMON_CLI_TAMPER_RE.search(event.command_line or ""):
-        reasons.append("コマンドラインで Sysmon のアンインストール/設定変更 (-u / -c) を検出")
-    elif _SYSMON_CLI_TAMPER_RE.search(event.parent_command_line or ""):
-        reasons.append("親プロセスで Sysmon のアンインストール/設定変更 (-u / -c) を検出")
+    # (ID 8/10/11/22 は専用スクリーニングに委ね、不要な部分一致誤検知を防止)
+    if event.event_id not in (8, 10, 11, 22):
+        if _SYSMON_CLI_TAMPER_RE.search(event.command_line or ""):
+            reasons.append("コマンドラインで Sysmon のアンインストール/設定変更 (-u / -c) を検出")
+        elif _SYSMON_CLI_TAMPER_RE.search(event.parent_command_line or ""):
+            reasons.append("親プロセスで Sysmon のアンインストール/設定変更 (-u / -c) を検出")
 
-    for keyword in config.SUSPICIOUS_KEYWORDS:
-        kw_lower = keyword.lower()
-        if kw_lower in cmd_lower:
-            reasons.append(f"コマンドラインに不審キーワード '{keyword}' を検出")
-        elif kw_lower in parent_cmd_lower:
-            reasons.append(f"親プロセスコマンドラインに不審キーワード '{keyword}' を検出")
+        for keyword in config.SUSPICIOUS_KEYWORDS:
+            kw_lower = keyword.lower()
+            if kw_lower in cmd_lower:
+                reasons.append(f"コマンドラインに不審キーワード '{keyword}' を検出")
+            elif kw_lower in parent_cmd_lower:
+                reasons.append(f"親プロセスコマンドラインに不審キーワード '{keyword}' を検出")
 
-    # 条件2: 一時ディレクトリからの実行ファイル・スクリプト起動検査
-    for temp_path in config.SUSPICIOUS_TEMP_PATHS:
-        tp_lower = temp_path.lower()
-        if tp_lower in img_lower:
-            if any(img_lower.endswith(ext) for ext in config.SUSPICIOUS_EXTENSIONS):
-                reasons.append(f"一時・不審ディレクトリからの実行ファイル起動 ({event.image})")
-            else:
-                reasons.append(f"一時・不審ディレクトリ内のプロセスイメージ起動 ({event.image})")
-        elif tp_lower in cmd_lower:
-            if any(ext in cmd_lower for ext in config.SUSPICIOUS_EXTENSIONS):
-                reasons.append(
-                    f"コマンドラインが一時・不審ディレクトリ内のスクリプト/実行ファイルを参照 ({temp_path})"
-                )
+    # 条件2: 一時ディレクトリからの実行ファイル・スクリプト起動検査 (プロセス生成・通信イベント向け)
+    if event.event_id in (1, 3, 4688):
+        for temp_path in config.SUSPICIOUS_TEMP_PATHS:
+            tp_lower = temp_path.lower()
+            if tp_lower in img_lower:
+                if any(img_lower.endswith(ext) for ext in config.SUSPICIOUS_EXTENSIONS):
+                    reasons.append(f"一時・不審ディレクトリからの実行ファイル起動 ({event.image})")
+                else:
+                    reasons.append(f"一時・不審ディレクトリ内のプロセスイメージ起動 ({event.image})")
+            elif tp_lower in cmd_lower:
+                if any(ext in cmd_lower for ext in config.SUSPICIOUS_EXTENSIONS):
+                    reasons.append(
+                        f"コマンドラインが一時・不審ディレクトリ内のスクリプト/実行ファイルを参照 ({temp_path})"
+                    )
 
     # 条件3: Sysmon Event ID 3 (ネットワーク接続) の一次スクリーニング
     if event.event_id == 3 and event.destination_ip:
         if event.destination_ip not in ("127.0.0.1", "::1", "0.0.0.0", "-"):
-            image_basename = img_lower.rsplit("\\", 1)[-1]
+            image_basename = _image_basename(event.image)
             if image_basename in config.SUSPICIOUS_NETWORK_IMAGES:
                 reasons.append(
                     f"LOLBin/スクリプトホスト ({image_basename}) による外部通信 "
