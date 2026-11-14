@@ -203,41 +203,51 @@ class GeminiTriageAgent:
     def _extract_severity(report_text: str) -> str:
         """
         レポート本文から最終評価レベル (`[CRITICAL]`, `[SUSPICIOUS]`, `[CLEAN]`) を抽出します。
-        説明文中の否定表現（例: 「現時点で [CRITICAL] と断定する悪性挙動はない」）に誤反応しないよう、
-        判定レベル宣言行および先頭付近の見出し行を最優先で解析します。
+        説明文中の否定表現（例: 「直ちに侵害（`[CRITICAL]`）と断定する明確な悪性挙動はない」）に誤反応しないよう、
+        判定レベル宣言行（次行に `[TAG]` が出力される見出し形式やバッククォート囲み含む）および
+        先頭付近のタグ行を最優先で解析します。
         """
         lines = [line.strip() for line in (report_text or "").splitlines() if line.strip()]
+        severities = (
+            config.SEVERITY_CRITICAL,
+            config.SEVERITY_SUSPICIOUS,
+            config.SEVERITY_CLEAN,
+        )
 
-        # 1. 「判定レベル」「評価レベル」を含む宣言行を最優先で確認
-        for line in lines[:10]:
-            upper_line = line.upper()
+        # 1. 「判定レベル」「評価レベル」を含む宣言行（同行または直後の行）を最優先で確認
+        for idx, line in enumerate(lines[:12]):
             if "判定レベル" in line or "評価レベル" in line:
-                for sev in (
-                    config.SEVERITY_CRITICAL,
-                    config.SEVERITY_SUSPICIOUS,
-                    config.SEVERITY_CLEAN,
-                ):
+                upper_line = line.upper()
+                for sev in severities:
                     if sev in upper_line:
                         return sev
+                if idx + 1 < len(lines):
+                    next_upper = lines[idx + 1].upper()
+                    for sev in severities:
+                        if sev in next_upper:
+                            return sev
 
-        # 2. 先頭付近の見出し行・単独タグ行から評価レベルを抽出
+        # 2. 先頭付近の見出し行・バッククォート囲み・単独タグ行から評価レベルを抽出
         tag_line_re = re.compile(
-            r"^\s*(?:[#>*\-\s]|\*\*)*(\[(CRITICAL|SUSPICIOUS|CLEAN)\])",
+            r"^\s*(?:[#>*\-\s`*_:\"']|\*\*)*(\[(CRITICAL|SUSPICIOUS|CLEAN)\])",
             re.IGNORECASE,
         )
-        for line in lines[:8]:
+        for line in lines[:12]:
             m = tag_line_re.match(line)
             if m:
                 return m.group(1).upper()
 
-        # 3. いずれにも該当しない場合のフォールバック
-        upper_text = (report_text or "").upper()
-        if config.SEVERITY_CRITICAL in upper_text:
-            return config.SEVERITY_CRITICAL
-        if config.SEVERITY_SUSPICIOUS in upper_text:
-            return config.SEVERITY_SUSPICIOUS
-        if config.SEVERITY_CLEAN in upper_text:
-            return config.SEVERITY_CLEAN
+        # 3. フォールバック時は否定・対比文脈（「[CRITICAL] と断定〜ない」「[CRITICAL] ではない」等）を除外して検索
+        cleaned_text = re.sub(
+            r"\[(?:CRITICAL|SUSPICIOUS|CLEAN)\][^\n。]*?(?:ではな|ではありませ|とは言えな|と断定|に該当せ|に当たら|ではな|ではございま|には至ら|ではな)",
+            "",
+            report_text or "",
+            flags=re.IGNORECASE,
+        )
+        upper_text = cleaned_text.upper()
+        for sev in severities:
+            if sev in upper_text:
+                return sev
         return config.SEVERITY_SUSPICIOUS
 
     @staticmethod
@@ -536,10 +546,17 @@ class GeminiTriageAgent:
         if any(tok in reasons_lower or tok in cmd_lower for tok in high_risk_tokens):
             return config.SEVERITY_CRITICAL
 
+        img_lower = (event.image or "").lower()
+        img_base = img_lower.replace("/", "\\").rsplit("\\", 1)[-1]
+        is_uv_python = "\\appdata\\roaming\\uv\\python\\" in img_lower and img_base in (
+            "python.exe",
+            "pythonw.exe",
+        )
         if (
             event.event_id == 3
+            and not is_uv_python
             and event.destination_ip not in ("", "-", "127.0.0.1", "::1", "0.0.0.0")
-            and any(tp.lower() in (event.image or "").lower() for tp in config.SUSPICIOUS_TEMP_PATHS)
+            and any(tp.lower() in img_lower for tp in config.SUSPICIOUS_TEMP_PATHS)
         ):
             return config.SEVERITY_CRITICAL
 

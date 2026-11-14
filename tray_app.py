@@ -123,6 +123,7 @@ class SysmonTrayApp:
         self.last_critical_incident: tuple[NormalizedEvent, str, str] | None = None
         self._active_confirmed_alert: bool = False
         self._pending_offline_alerts: list[tuple[NormalizedEvent, str]] = []
+        self._critical_dialog_last_shown: dict[int, float] = {}
         self._stop_event = threading.Event()
         self._scan_now_event = threading.Event()
         self._lock = threading.Lock()
@@ -317,11 +318,22 @@ class SysmonTrayApp:
             already_shown_critical = (
                 from_reconciliation and previous_offline_severity == config.SEVERITY_CRITICAL
             )
-            if not already_shown_critical:
+            pid_key = candidate.process_id if candidate.process_id is not None else -candidate.event_id
+            now_mono = time.monotonic()
+            last_popup = self._critical_dialog_last_shown.get(pid_key, 0.0)
+            in_cooldown = last_popup > 0.0 and (now_mono - last_popup) < 120.0
+
+            if not already_shown_critical and not in_cooldown:
+                self._critical_dialog_last_shown[pid_key] = now_mono
                 show_critical_response_dialog(
                     candidate,
                     rep_text,
                     self.last_report_path,
+                )
+            elif in_cooldown:
+                logger.info(
+                    "同一対象 (PID=%s) の迎撃パネルは120秒以内に表示済みのため自動ポップアップを抑止しました。",
+                    candidate.process_id,
                 )
         elif severity == config.SEVERITY_SUSPICIOUS and self.current_state != STATE_CRITICAL:
             self.set_status(

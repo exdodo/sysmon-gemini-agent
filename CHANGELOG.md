@@ -2,6 +2,18 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.13] - 2026-11-14
+複数行見出し・バッククォート形式の判定レベル抽出バグ修正（`pythonw.exe` `[SUSPICIOUS]` 時の誤った迎撃パネル表示を防止）および連続ダイアログ抑止クールダウンを実装。
+
+### 修正・改善
+- **`_extract_severity()` の見出し＋次行・バッククォート抽出対応 (`agent.py`)**:
+  - Gemini 応答が `### 判定レベル` の次行に `` `[SUSPICIOUS]` `` / `` `[CLEAN]` `` を出力した際、本文中の否定文脈（「直ちに侵害（`[CRITICAL]`）と断定する悪性挙動はない」等）を誤って `[CRITICAL]` と誤認する不具合を修正。
+  - これにより `pythonw.exe` 等が `[SUSPICIOUS]` と判定された際は黄色アイコン／通知のみに留まり、迎撃パネルや Microsoft Defender 緊急スキャンが作動しなくなりました。
+- **オフライン判定時の `uv` Python 過剰昇格防止 (`agent.py`)**:
+  - `classify_offline_severity()` で `\appdata\roaming\uv\python\` 配下の `python.exe` / `pythonw.exe` を一律 `[CRITICAL]` に昇格させず `[SUSPICIOUS]` として扱うよう調整（高危険キーワード・`[CRITICAL候補]` 時は引き続き `[CRITICAL]`）。
+- **迎撃パネルの連続ポップアップ抑制 (`tray_app.py`)**:
+  - 同一 PID に対して短時間（120秒以内）に複数イベントが `[CRITICAL]` 判定となった場合、迎撃ウィンドウの多重表示を自動抑止するよう改善（アイコン赤表示および右クリックからの手動再表示は維持）。
+
 ## [1.12] - 2026-11-14
 誤検知抑制・`uv` 管理 Python ランタイム対応・ホットリロード対応ホワイトリスト（`allowlist.json`）およびトリアージ評価レベル抽出バグ修正を実装。
 
