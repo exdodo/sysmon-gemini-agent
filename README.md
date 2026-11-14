@@ -1,6 +1,6 @@
 # Windows Event Log & Sysmon 監視エージェント (Google Gemini版)
 
-> **Version**: `1.13`（変更履歴は [CHANGELOG.md](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/CHANGELOG.md) を参照）
+> **Version**: `1.14`（変更履歴は [CHANGELOG.md](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/CHANGELOG.md) を参照）
 
 Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, `System`）を定期巡回し、**ルールベースの一次スクリーニング**と **Google Gemini (`google-genai` SDK) の自律調査ループ（Function Calling）**、および **オフライン・API障害時のローカル即時フォールバック判定** を組み合わせて、不審なプロセス・インジェクション・永続化・外部通信の兆候を安全かつ低コストにトリアージする監視エージェントです。
 
@@ -29,8 +29,12 @@ Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, 
      - 自作ツールや開発スクリプト等の明らかな誤検知は `allowlist.json`（再起動不要・ホットリロード対応）へ登録して除外できます（ただし改ざん検知・CreateRemoteThread・LSASSアクセス等の重大脅威は安全ガードによりバイパス不可）。
      - `AppData\Roaming\uv\python\` 配下の `uv` 管理 Python ランタイムは、Temp/公開フォルダ上のスクリプト実行や不審コマンドライン・C2通信を伴わない限り安全側としてノイズを抑制します。
 
-2. **【第2層: Gemini 自律調査ループ & オフラインフォールバック (`agent.py`, `tools.py`)】**
+2. **【第2層: Gemini 自律調査ループ & `[CLEAN]` キャッシュ / オフラインフォールバック (`agent.py`, `triage_cache.py`, `tools.py`)】**
    - 最新の公式 `google-genai` SDK (`from google import genai` / `client = genai.Client()`) を使用し、デフォルト（`GEMINI_MODEL="auto"`）で起動時および6時間ごとに `client.models.list()` から**その時点で利用可能な最新の軽量・高速モデル（例: `gemini-4-hydrogen` 等）を自動選択**します（404/廃止検知時も自動で後継モデルへ切り替えます）。
+   - **`[CLEAN]` 判定キャッシュ & 短文出力によるAPIコスト最適化**:
+     - Gemini により `[CLEAN]` と判定された安全なイベントパターンを正規化フィンガープリントで `triage_cache.json` に保存（有効期限 24 時間）し、期間内の同一パターン再検出時は Gemini API 問い合わせおよび `incident_YYYYMMDD.md` への重複追記をスキップします（`agent_runtime.log` にのみ記録）。
+     - 改ざん検知・注入（ID 8）・LSASSアクセス（ID 10）・危険キーワード・ログオン失敗（ID 4625）・`[SUSPICIOUS]`/`[CRITICAL]` 判定は安全ガードによりキャッシュ対象外とし、毎回必ず検査します。
+     - 新規パターンの問い合わせ時も、`[CLEAN]` 判定時は出力トークン節約のため「判定レベル＋1行の簡潔な根拠のみ」の短文で回答します（`[SUSPICIOUS]`/`[CRITICAL]` 時は従来通り詳細レポートを出力）。
    - **オフライン / API障害フォールバック**: Gemini API への接続失敗・レート制限超過・タイムアウト時は、ローカルルールによる緊急判定（`[CRITICAL]` / `[SUSPICIOUS]`）へ自動切替し、`alerts/incident_YYYYMMDD.md` への記録、トレイ通知・色変化、Microsoft Defender 緊急スキャン通報、CRITICAL迎撃ダイアログ表示を途切れさせません（`--offline` オプションによる完全オフライン監視も可能）。
    - **トークン最適化（Trimming）**: 生のイベントXML全体は送信せず、重要8フィールド（`UtcTime`, `ProcessId`, `Image`, `CommandLine`, `ParentProcessId`, `ParentCommandLine`, `DestinationIp`, `DestinationPort`）のみを辞書形式でプロンプトに渡します。
    - **自律調査ツール（完全Read-Only）**:
@@ -160,9 +164,10 @@ cd C:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent
 
 1. **完全読み取り専用（Read-Only）の監視・調査**:
    - Windowsイベントログの消去・変更、OS設定の変更、サービスの停止、プロセスの強制終了（kill）、ファイアウォール遮断などのアクティブな介入は一切行いません。
-2. **ファイル破棄処理の完全排除**:
-   - ファイルやディレクトリの削除処理、および既存レポートの上書き初期化処理は一切含まれていません。
-   - ファイル書き込みは `checkpoint.json`（最新 `EventRecordID` の保存）および `alerts/` 配下へのログ・レポートの**追記（`mode="a"`）**のみに限定されています。
+2. **安全なファイル管理とログ保持制限 (`log_retention.py`)**:
+   - OS中枢や作業ディレクトリ外への削除・書換処理は一切含まれていません。
+   - ファイル書き込みは `checkpoint.json`、`triage_cache.json`、および `alerts/` 配下への追記に限定されています。
+   - ディスク枯渇を防ぐため、`alerts/agent_runtime.log` は `RotatingFileHandler`（5 MB × 最大 5 世代）で自動ローテーションし、`alerts/incident_YYYYMMDD.md` は保持期間 30 日・`alerts/` 合計 100 MB 上限で古い日付の過去ファイルのみを自動整理します（当日分は保護）。
 3. **API浪費・無限ループ防止**:
    - 一次スクリーニングを通過した不審イベントのみをGeminiに送信し、Function Calling の最大往復回数を `max_depth = 3` にハードリミットしています。
    - APIレート制限（HTTP 429 / `ResourceExhausted`）発生時は指数バックオフ（Exponential Backoff）により自動待機・リトライを行います。
@@ -173,8 +178,10 @@ cd C:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent
 
 | ファイル名 | 役割 |
 | :--- | :--- |
-| `config.py` | 監視対象チャネル・イベントID、一次フィルタ用キーワード、Geminiモデル、`MAX_DEPTH = 3` 等の設定定義 |
-| `allowlist.py` | ホットリロード対応の許可リスト (`allowlist.json`) 判定・安全ガード・GUI登録ロジック |
+| `config.py` | 監視対象チャネル・イベントID、一次フィルタ用キーワード、Geminiモデル、`MAX_DEPTH = 3`、キャッシュ/ログ保持制限等の設定定義 |
+| `allowlist.py` | ホットリロード対応の許可リスト (`allowlist.json`) 判定・高危険イベント安全ガード・GUI登録ロジック |
+| `triage_cache.py` | `[CLEAN]` 判定パターンの正規化フィンガープリント生成・24時間永続キャッシュ (`triage_cache.json`) 管理 |
+| `log_retention.py` | `alerts/incident_YYYYMMDD.md` の保持期間（30日）・合計容量上限（100 MB）に基づく安全な自動整理 |
 | `event_reader.py` | `pywin32` (`win32evtlog`) によるイベント取得、`xml.etree.ElementTree` によるXMLパース、一次スクリーニング、`checkpoint.json` 管理 |
 | `tools.py` | Gemini Function Calling 用 Read-Only ツール関数（`get_parent_process`, `get_process_network_activity`, `get_process_related_events`） |
 | `agent.py` | 公式 `google-genai` SDK による自律調査ループ（`max_depth = 3` 制御、指数バックオフ、オフライン/API障害フォールバック、`alerts/incident_YYYYMMDD.md` 追記出力） |

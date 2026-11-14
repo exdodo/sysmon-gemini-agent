@@ -2,6 +2,20 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.14] - 2026-11-15
+`[CLEAN]` 判定キャッシュによる重複 API 問い合わせ抑止、`[CLEAN]` 回答の短文出力化によるトークン削減、および過去ログ・レポートの容量/期間ローテーションを実装。
+
+### 追加・改善
+- **`[CLEAN]` 判定永続キャッシュによる重複問い合わせ抑止 (`triage_cache.py`, `agent.py`, `config.py`)**:
+  - `UtcTime` / `PID` / `EventRecordID` / `--csrf_token` 等の動的引数を除外・正規化した SHA-256 フィンガープリントにより、`[CLEAN]` と判定された安全なイベントパターンを `triage_cache.json` に24時間キャッシュ（`CLEAN_CACHE_TTL_SECONDS = 86400`）。
+  - 同一パターン再検出時は Gemini API 問い合わせと `incident_YYYYMMDD.md` への重複追記をスキップし、`agent_runtime.log` にのみ記録。
+  - **安全ガード (`allowlist.is_high_risk_protected_event`)**: 改ざん検知（Sysmon `4/16/255`, Security `1102/4719`, System `104/7036/7040`）、注入（ID `8`）、LSASSアクセス（ID `10`）、危険キーワード、リモートログオン失敗（ID `4625`）、および `[SUSPICIOUS]` / `[CRITICAL]` 判定はキャッシュ対象外として毎回検査。
+- **`[CLEAN]` 時の AI 回答短文化 (`agent.py`)**:
+  - `SYSTEM_INSTRUCTION` を最適化し、`[CLEAN]` 判定時は「判定レベル＋1行の簡潔な根拠のみ」出力するよう変更して出力トークンコストとレポート肥大化を削減（`[SUSPICIOUS]` / `[CRITICAL]` 時は従来の詳細フォーマットを維持）。
+- **ログ・レポートの容量/期間制限 (`main.py`, `log_retention.py`, `agent.py`, `config.py`)**:
+  - `alerts/agent_runtime.log` を `RotatingFileHandler`（5 MB × 5 世代）へ移行。
+  - `alerts/incident_YYYYMMDD.md` に対し保持期間 30 日・`alerts/` 合計 100 MB 上限の安全クリーンアップ（当日分保護・対象ファイル名厳密一致）を実装。
+
 ## [1.13] - 2026-11-14
 複数行見出し・バッククォート形式の判定レベル抽出バグ修正（`pythonw.exe` `[SUSPICIOUS]` 時の誤った迎撃パネル表示を防止）および連続ダイアログ抑止クールダウンを実装。
 

@@ -13,7 +13,7 @@ from pathlib import Path
 # ============================================================================
 # アプリケーションバージョン定義 (機能追加時に更新し、CHANGELOG.md / Gitタグと同期)
 # ============================================================================
-APP_VERSION: str = "1.13"
+APP_VERSION: str = "1.14"
 
 # ============================================================================
 # パス設定 (ワークスペース内に閉じた設計・親ディレクトリへのアクセス禁止)
@@ -23,6 +23,22 @@ CHECKPOINT_FILE: Path = BASE_DIR / "checkpoint.json"
 ALERTS_DIR: Path = BASE_DIR / "alerts"
 AGENT_LOG_FILE: Path = ALERTS_DIR / "agent_runtime.log"
 ALLOWLIST_FILE: Path = BASE_DIR / "allowlist.json"
+TRIAGE_CACHE_FILE: Path = BASE_DIR / "triage_cache.json"
+
+# ============================================================================
+# [CLEAN] 判定キャッシュ & ログ保持・ローテーション設定
+# ============================================================================
+# 同一パターン [CLEAN] 判定キャッシュ有効期限 (24時間 = 86400秒)
+CLEAN_CACHE_TTL_SECONDS: int = 86400
+CLEAN_CACHE_MAX_ENTRIES: int = 2000
+
+# 実行ログ (agent_runtime.log) の自動ローテーション設定 (5 MB × 5 世代)
+RUNTIME_LOG_MAX_BYTES: int = 5 * 1024 * 1024
+RUNTIME_LOG_BACKUP_COUNT: int = 5
+
+# 日次インシデントレポート (incident_YYYYMMDD.md) の保持期間と alerts/ 合計容量上限
+INCIDENT_LOG_RETENTION_DAYS: int = 30
+ALERTS_DIR_MAX_BYTES: int = 100 * 1024 * 1024
 
 # ============================================================================
 # 定期巡回・収集設定

@@ -130,7 +130,7 @@ def load_allowlist(allowlist_path: Path | None = None) -> dict[str, list[str]]:
             return {k: [] for k in DEFAULT_ALLOWLIST_DATA}
 
 
-def _is_protected_against_allowlist(event: NormalizedEvent) -> bool:
+def is_high_risk_protected_event(event: NormalizedEvent) -> bool:
     """改ざん検知・注入・LSASSアクセス等の絶対警戒イベントかどうかを返します。"""
     if event.channel == config.SYSMON_CHANNEL and event.event_id in (4, 8, 10, 16, 255):
         return True
@@ -151,6 +151,11 @@ def _is_protected_against_allowlist(event: NormalizedEvent) -> bool:
     if any(kw in combined_lower for kw in _NEVER_ALLOWLIST_KEYWORDS):
         return True
     return False
+
+
+def _is_protected_against_allowlist(event: NormalizedEvent) -> bool:
+    """後方互換エイリアス: `is_high_risk_protected_event` を呼び出します。"""
+    return is_high_risk_protected_event(event)
 
 
 def is_event_allowlisted(

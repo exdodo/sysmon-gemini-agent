@@ -33,8 +33,10 @@ except ImportError:
 
 import config
 from event_reader import NormalizedEvent
+from log_retention import cleanup_old_incident_reports
 from process_guard import verify_target_process
 from tools import AVAILABLE_TOOLS, TOOL_DISPATCH_MAP
+from triage_cache import CleanTriageCache
 
 logger = logging.getLogger("sysmon_gemini_agent.agent")
 
@@ -48,10 +50,14 @@ SYSTEM_INSTRUCTION = """あなたはWindowsセキュリティ監視（SOC）の�
    - `[CLEAN]` : 正規の管理操作・OS標準動作・誤検知と判断できる場合
    - `[SUSPICIOUS]` : 不審な兆候があるが単独では確定できず、管理者への確認・追加監視が必要な場合
    - `[CRITICAL]` : 難読化コマンド実行、LOLBin悪用、不審な外部C2通信・DNSトンネリング、スレッド注入（ID 8）、LSASSメモリダンプ疑い（ID 10）、危険な永続化（ID 11/12/13）、権限昇格・侵害の強い兆候、または Sysmon 停止/設定改ざん/ログ消去（EventID 4, 16, 104, 1102, 4719, EventRecordID巻き戻り等）の防衛機能妨害（Defense Evasion）がある場合
-3. 最終回答の構成（Markdown形式）:
-   - **判定レベル**: `[CLEAN]`, `[SUSPICIOUS]`, `[CRITICAL]` のいずれか
-   - **判定理由**: イベント内容およびツール調査結果に基づく具体的な根拠（箇条書き）
-   - **推奨確認事項**: セキュリティ担当者が次に確認すべき具体的な調査項目（箇条書き・すべて読み取り専用の確認手順とすること）
+3. 最終回答の構成（出力コスト最適化のため `[CLEAN]` のみ極力短文で出力すること）:
+   - **`[CLEAN]` と判定する場合**（以下の2行のみ出力し、長文解説や推奨確認事項は出力しないこと）:
+     - **判定レベル**: `[CLEAN]`
+     - **判定理由**: （正規動作・誤検知と判断した簡潔な根拠を1文・80文字以内で記載）
+   - **`[SUSPICIOUS]` または `[CRITICAL]` と判定する場合**:
+     - **判定レベル**: `[SUSPICIOUS]` または `[CRITICAL]`
+     - **判定理由**: イベント内容およびツール調査結果に基づく具体的な根拠（箇条書き）
+     - **推奨確認事項**: セキュリティ担当者が次に確認すべき具体的な調査項目（箇条書き・すべて読み取り専用の確認手順とすること）
 """
 
 
@@ -70,6 +76,7 @@ class GeminiTriageAgent:
         max_depth: int = config.MAX_DEPTH,
         alerts_dir: Path = config.ALERTS_DIR,
         offline_only: bool = False,
+        triage_cache: CleanTriageCache | None = None,
     ) -> None:
         self.offline_only: bool = offline_only
         self._api_offline_until: float = 0.0
@@ -77,6 +84,11 @@ class GeminiTriageAgent:
         self.alerts_dir: Path = alerts_dir
         self.alerts_dir.mkdir(parents=True, exist_ok=True)
         self._last_model_refresh_ts: float = 0.0
+        self._last_cleanup_date: str = datetime.now().astimezone().strftime("%Y%m%d")
+        cleanup_old_incident_reports(alerts_dir=self.alerts_dir)
+        self.triage_cache: CleanTriageCache | None = (
+            None if self.offline_only else (triage_cache or CleanTriageCache())
+        )
 
         if self.offline_only:
             self.client = None
@@ -687,6 +699,27 @@ class GeminiTriageAgent:
         Gemini API で再トリアージします。
         APIが依然として到達不能な場合は重複フォールバックレポートを出さず None を返します。
         """
+        if self.triage_cache is not None:
+            cached = self.triage_cache.lookup(event)
+            if cached is not None:
+                logger.info(
+                    "[キャッシュ一致] オフライン保留イベントは過去 [CLEAN] 判定と一致したため再問い合わせをスキップしました: "
+                    "EventID=%d, RecordID=%d, Image=%s",
+                    event.event_id,
+                    event.event_record_id,
+                    event.image,
+                )
+                return {
+                    "severity": config.SEVERITY_CLEAN,
+                    "depth_used": 0,
+                    "tool_trace": [],
+                    "report_text": f"[CLEAN] (キャッシュ一致により再問い合わせ省略: {cached.get('summary', '')})",
+                    "report_file": "",
+                    "offline_fallback": False,
+                    "reconciled_from_offline": True,
+                    "cache_hit": True,
+                }
+
         if not self.can_attempt_online_now():
             return None
 
@@ -703,6 +736,9 @@ class GeminiTriageAgent:
             return None
 
         severity = self._extract_severity(report_text)
+        if severity == config.SEVERITY_CLEAN and self.triage_cache is not None:
+            self.triage_cache.store_clean(event, report_text)
+
         reconciled_report = (
             "✅ **【オンライン復旧・Gemini API 再判定レポート】** "
             "オフラインフォールバック後に通信が復旧したため、Gemini API による再評価を実行しました。\n\n"
@@ -728,10 +764,32 @@ class GeminiTriageAgent:
         """
         単一の不審候補イベントに対して Gemini Function Calling ループを実行します。
         `max_depth = 3` を厳格に適用し、最大3往復で必ず調査を打ち切ってレポートを生成します。
+        過去24時間以内に `[CLEAN]` 判定済みの同一パターンの場合は API 問い合わせとレポート追記をスキップします。
         オフライン環境や API 障害時は、ローカルルールによるフォールバック判定へ自動切替します。
         """
         if self.offline_only or self.client is None:
             return self.investigate_offline(event, error_reason="オフライン専用モード")
+
+        if self.triage_cache is not None:
+            cached = self.triage_cache.lookup(event)
+            if cached is not None:
+                logger.info(
+                    "[キャッシュ一致] 過去の [CLEAN] 判定と同一パターンのため Gemini API 問い合わせとレポート追記をスキップします: "
+                    "EventID=%d, RecordID=%d, Image=%s, CacheKey=%s",
+                    event.event_id,
+                    event.event_record_id,
+                    event.image,
+                    str(cached.get("cache_key", ""))[:12],
+                )
+                return {
+                    "severity": config.SEVERITY_CLEAN,
+                    "depth_used": 0,
+                    "tool_trace": [],
+                    "report_text": f"[CLEAN] (キャッシュ一致により省略: {cached.get('summary', '')})",
+                    "report_file": "",
+                    "offline_fallback": False,
+                    "cache_hit": True,
+                }
 
         if not self.can_attempt_online_now():
             return self.investigate_offline(
@@ -751,6 +809,9 @@ class GeminiTriageAgent:
             return self.investigate_offline(event, error_reason=str(triage_exc))
 
         severity = self._extract_severity(report_text)
+        if severity == config.SEVERITY_CLEAN and self.triage_cache is not None:
+            self.triage_cache.store_clean(event, report_text)
+
         report_file = self.append_triage_report(
             event=event,
             severity=severity,
@@ -783,6 +844,9 @@ class GeminiTriageAgent:
         self.alerts_dir.mkdir(parents=True, exist_ok=True)
         now_local = datetime.now().astimezone()
         date_str = now_local.strftime("%Y%m%d")
+        if date_str != self._last_cleanup_date:
+            cleanup_old_incident_reports(alerts_dir=self.alerts_dir, today=now_local.date())
+            self._last_cleanup_date = date_str
         timestamp_str = now_local.strftime("%Y-%m-%d %H:%M:%S %z")
         report_path = self.alerts_dir / f"incident_{date_str}.md"
 

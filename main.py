@@ -11,6 +11,7 @@ from __future__ import annotations
 import argparse
 import ctypes
 import logging
+from logging.handlers import RotatingFileHandler
 import sys
 import time
 
@@ -40,9 +41,13 @@ def setup_logging() -> logging.Logger:
             console_handler.setFormatter(formatter)
             logger.addHandler(console_handler)
 
-        # ファイルハンドラ（安全制約に従い追記 mode="a" のみ）
-        file_handler = logging.FileHandler(
-            config.AGENT_LOG_FILE, mode="a", encoding="utf-8"
+        # ファイルハンドラ（自動ローテーション付き追記: 5 MB × 5 世代）
+        file_handler = RotatingFileHandler(
+            config.AGENT_LOG_FILE,
+            mode="a",
+            maxBytes=config.RUNTIME_LOG_MAX_BYTES,
+            backupCount=config.RUNTIME_LOG_BACKUP_COUNT,
+            encoding="utf-8",
         )
         file_handler.setFormatter(formatter)
         logger.addHandler(file_handler)
@@ -143,7 +148,11 @@ def run_monitoring_loop(
                     if is_offline and not offline_only and len(pending_offline_events) < 50:
                         pending_offline_events.append(candidate)
 
-                    mode_note = " [オフライン/フォールバック]" if is_offline else ""
+                    mode_note = (
+                        " [オフライン/フォールバック]"
+                        if is_offline
+                        else (" [キャッシュ一致]" if result.get("cache_hit") else "")
+                    )
                     logger.info(
                         "[%d/%d] 調査完了%s: 判定=%s, ツール往復回数=%d/%d, 出力先=%s",
                         idx,
@@ -152,7 +161,7 @@ def run_monitoring_loop(
                         result["severity"],
                         result["depth_used"],
                         config.MAX_DEPTH,
-                        result["report_file"],
+                        result.get("report_file") or "(キャッシュ一致・追記省略)",
                     )
                     if result["severity"] == config.SEVERITY_CRITICAL:
                         show_critical_response_dialog(
