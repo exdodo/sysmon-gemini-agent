@@ -1,6 +1,6 @@
 # Windows Event Log & Sysmon 監視エージェント (Google Gemini版)
 
-> **Version**: `1.11`（変更履歴は [CHANGELOG.md](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/CHANGELOG.md) を参照）
+> **Version**: `1.12`（変更履歴は [CHANGELOG.md](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/CHANGELOG.md) を参照）
 
 Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, `System`）を定期巡回し、**ルールベースの一次スクリーニング**と **Google Gemini (`google-genai` SDK) の自律調査ループ（Function Calling）**、および **オフライン・API障害時のローカル即時フォールバック判定** を組み合わせて、不審なプロセス・インジェクション・永続化・外部通信の兆候を安全かつ低コストにトリアージする監視エージェントです。
 
@@ -24,8 +24,10 @@ Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, 
      - `Security`（Event ID `1102`: 監査ログ消去, `4624`/`4625`: ログオン成否, `4688`: プロセス作成 ※Sysmon未導入/停止時の自動フォールバック, `4719`: 監査ポリシー変更）
      - `System`（Event ID `104`: イベントログ消去, `7036`/`7040`: Sysmon・EventLogサービス停止/無効化）
    - **サービス死活監視（Heartbeat）**: `Sysmon64`/`Sysmon` および `EventLog` サービスの停止・消失を巡回ごとに監視し、Sysmon 停止中は自動で `Security 4688` 監視へ切り替えます。
-   - **一次フィルタ（APIコスト最適化）**:
+   - **一次フィルタ（APIコスト最適化） & ホワイトリスト (`allowlist.py`, `allowlist.json`)**:
      - すべてのイベントをGeminiに送信せず、難読化・LOLBin悪用・Sysmon/ログ改ざんキーワード・一時ディレクトリ起動・拡張Sysmon検知（ID 8/10/11/12/13/22）に合致する「不審候補」のみを抽出します。
+     - 自作ツールや開発スクリプト等の明らかな誤検知は `allowlist.json`（再起動不要・ホットリロード対応）へ登録して除外できます（ただし改ざん検知・CreateRemoteThread・LSASSアクセス等の重大脅威は安全ガードによりバイパス不可）。
+     - `AppData\Roaming\uv\python\` 配下の `uv` 管理 Python ランタイムは、Temp/公開フォルダ上のスクリプト実行や不審コマンドライン・C2通信を伴わない限り安全側としてノイズを抑制します。
 
 2. **【第2層: Gemini 自律調査ループ & オフラインフォールバック (`agent.py`, `tools.py`)】**
    - 最新の公式 `google-genai` SDK (`from google import genai` / `client = genai.Client()`) を使用し、デフォルト（`GEMINI_MODEL="auto"`）で起動時および6時間ごとに `client.models.list()` から**その時点で利用可能な最新の軽量・高速モデル（例: `gemini-4-hydrogen` 等）を自動選択**します（404/廃止検知時も自動で後継モデルへ切り替えます）。
@@ -143,7 +145,10 @@ cd C:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent
   - **赤色（！マーク）**: **`[CRITICAL]`（深刻な脅威検知）** または **重大なエラー（管理者権限不足・APIキー未設定・通信障害等）発生時**（デスクトップ通知も同時に表示されます）
 - **右クリックメニュー**:
   - 「今すぐ巡回を実行」
+  - 「直近のCRITICAL迎撃パネル (Suspend/Kill) を開く」
+  - 「許可リスト (`allowlist.json`) を開く」
   - 「アラート出力フォルダ (`alerts`) を開く」
+  - 「実行ログ (`agent_runtime.log`) を開く」
   - 「アイコンを正常色（緑）にリセット」
   - 「安全に終了 (`Exit`)」（チェックポイントを保存して停止）
 
@@ -169,6 +174,7 @@ cd C:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent
 | ファイル名 | 役割 |
 | :--- | :--- |
 | `config.py` | 監視対象チャネル・イベントID、一次フィルタ用キーワード、Geminiモデル、`MAX_DEPTH = 3` 等の設定定義 |
+| `allowlist.py` | ホットリロード対応の許可リスト (`allowlist.json`) 判定・安全ガード・GUI登録ロジック |
 | `event_reader.py` | `pywin32` (`win32evtlog`) によるイベント取得、`xml.etree.ElementTree` によるXMLパース、一次スクリーニング、`checkpoint.json` 管理 |
 | `tools.py` | Gemini Function Calling 用 Read-Only ツール関数（`get_parent_process`, `get_process_network_activity`, `get_process_related_events`） |
 | `agent.py` | 公式 `google-genai` SDK による自律調査ループ（`max_depth = 3` 制御、指数バックオフ、オフライン/API障害フォールバック、`alerts/incident_YYYYMMDD.md` 追記出力） |

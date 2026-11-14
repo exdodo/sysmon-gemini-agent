@@ -13,7 +13,7 @@ from pathlib import Path
 # ============================================================================
 # アプリケーションバージョン定義 (機能追加時に更新し、CHANGELOG.md / Gitタグと同期)
 # ============================================================================
-APP_VERSION: str = "1.11"
+APP_VERSION: str = "1.12"
 
 # ============================================================================
 # パス設定 (ワークスペース内に閉じた設計・親ディレクトリへのアクセス禁止)
@@ -22,6 +22,7 @@ BASE_DIR: Path = Path(__file__).resolve().parent
 CHECKPOINT_FILE: Path = BASE_DIR / "checkpoint.json"
 ALERTS_DIR: Path = BASE_DIR / "alerts"
 AGENT_LOG_FILE: Path = ALERTS_DIR / "agent_runtime.log"
+ALLOWLIST_FILE: Path = BASE_DIR / "allowlist.json"
 
 # ============================================================================
 # 定期巡回・収集設定

@@ -179,6 +179,7 @@ cython_debug/
 #  refer to https://docs.cursor.com/context/ignore-files
 .cursorignore
 .cursorindexingignore
-# Runtime alerts, logs, and checkpoints
+# Runtime alerts, logs, checkpoints, and user allowlist
 alerts/
 checkpoint.json
+allowlist.json

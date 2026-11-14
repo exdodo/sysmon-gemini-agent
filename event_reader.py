@@ -20,6 +20,7 @@ import time
 from typing import Any
 import xml.etree.ElementTree as ET
 
+import allowlist
 import config
 
 logger = logging.getLogger("sysmon_gemini_agent.event_reader")
@@ -35,6 +36,12 @@ except ImportError:
 # Sysmon CLI 無効化・設定改ざんコマンド検出パターン (プロジェクト名 sysmon-gemini-agent 等への誤検知を防ぐ)
 _SYSMON_CLI_TAMPER_RE = re.compile(
     r"\bsysmon(?:64)?(?:\.exe)?\s+[-/](?:u|c)\b",
+    re.IGNORECASE,
+)
+
+# `uv` 管理 Python インタプリタ実行ファイルパス（AppData\Roaming\uv\python\...\python[w].exe）
+_UV_PYTHON_EXE_RE = re.compile(
+    r"[a-z]:\\[^\"'\r\n]*\\appdata\\roaming\\uv\\python\\[^\"'\r\n]*\\pythonw?\.exe",
     re.IGNORECASE,
 )
 
@@ -649,6 +656,65 @@ def _screen_dns_event(event: NormalizedEvent, reasons: list[str]) -> None:
             reasons.append(f"DNSトンネリング疑いの異常長クエリを検知 ({qname})")
 
 
+def _is_uv_python_runtime(img_lower: str) -> bool:
+    """`uv` 管理の公式 Python ランタイム (`AppData\\Roaming\\uv\\python\\...`) かを判定します。"""
+    return (
+        "\\appdata\\roaming\\uv\\python\\" in img_lower
+        and _image_basename(img_lower) in ("python.exe", "pythonw.exe")
+    )
+
+
+def _find_temp_payload_in_command_line(cmd_lower: str) -> str | None:
+    """
+    コマンドラインが一時・不審ディレクトリ配下の実行ファイル・スクリプトを参照している場合、
+    一致したディレクトリパターンを返します（`uv` Python 本体のパス文字列は除外して誤検知を防ぎます）。
+    """
+    if not cmd_lower:
+        return None
+    cleaned_cmd = _UV_PYTHON_EXE_RE.sub("", cmd_lower)
+    high_risk_temp = ("\\appdata\\local\\temp\\", "\\windows\\temp\\", "\\users\\public\\")
+
+    for temp_path in config.SUSPICIOUS_TEMP_PATHS:
+        tp_lower = temp_path.lower()
+        if tp_lower not in cleaned_cmd:
+            continue
+        exts = (
+            config.SUSPICIOUS_EXTENSIONS + (".py", ".pyw")
+            if tp_lower in high_risk_temp
+            else config.SUSPICIOUS_EXTENSIONS
+        )
+        ext_alt = "|".join(re.escape(ext) for ext in exts)
+        pattern = re.escape(tp_lower) + r"[^\"'\r\n]*?(?:" + ext_alt + r")(?=[\s\"';,&|]|$)"
+        if re.search(pattern, cleaned_cmd, re.IGNORECASE):
+            return temp_path
+    return None
+
+
+def _enrich_live_command_line_if_empty(event: NormalizedEvent) -> None:
+    """
+    Sysmon Event ID 3 等で CommandLine が欠落している場合、対象プロセスがまだ稼働中であれば
+    psutil を用いて読み取り専用で実際のコマンドラインと親PIDを補完します。
+    """
+    if event.command_line or not event.process_id or event.process_id <= 4:
+        return
+    if not HAS_PSUTIL or psutil is None:
+        return
+
+    try:
+        proc = psutil.Process(event.process_id)
+        expected_base = _image_basename(event.image)
+        actual_name = (proc.name() or "").lower()
+        if expected_base and expected_base != actual_name:
+            return
+        cmdline_list = proc.cmdline()
+        if cmdline_list:
+            event.command_line = " ".join(cmdline_list)
+        if event.parent_process_id is None:
+            event.parent_process_id = proc.ppid()
+    except Exception:
+        return
+
+
 def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
     """
     【第1層: ルールベース一次スクリーニング】
@@ -664,9 +730,28 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
     6. 拡張Sysmon検知: スレッド注入 (ID 8)、LSASSメモリ読取等 (ID 10)、
        永続化/不審ファイル作成 (ID 11)、レジストリ永続化/無効化 (ID 12/13)、DNS (ID 22)。
     """
+    # 監視エージェント自身のプロセス (API通信やイベント照会等) による自己検知を防止
+    if event.process_id in (os.getpid(), os.getppid()) and event.event_id in (1, 3, 22):
+        event.screening_reasons = []
+        return (False, [])
+
+    img_lower = (event.image or "").lower()
+    is_uv_python = _is_uv_python_runtime(img_lower)
+
+    # ID 3 等でコマンドラインが空の不審候補/Pythonプロセスは稼働中情報からコマンドラインを補完
+    if (
+        event.event_id == 3
+        and not event.command_line
+        and (
+            is_uv_python
+            or _image_basename(img_lower) in config.SUSPICIOUS_NETWORK_IMAGES
+            or any(tp.lower() in img_lower for tp in config.SUSPICIOUS_TEMP_PATHS)
+        )
+    ):
+        _enrich_live_command_line_if_empty(event)
+
     reasons: list[str] = list(event.screening_reasons)
     cmd_lower = (event.command_line or "").lower()
-    img_lower = (event.image or "").lower()
     parent_cmd_lower = (event.parent_command_line or "").lower()
 
     # 条件0: Sysmon / ログ改ざん・サービス停止関連のイベントID直接検知
@@ -725,20 +810,20 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
             elif kw_lower in parent_cmd_lower:
                 reasons.append(f"親プロセスコマンドラインに不審キーワード '{keyword}' を検出")
 
-    # 条件2: 一時ディレクトリからの実行ファイル・スクリプト起動検査 (プロセス生成・通信イベント向け)
-    if event.event_id in (1, 3, 4688):
+    # 条件2: 一時ディレクトリからの実行ファイル・スクリプト起動検査 (プロセス生成イベントのみ対象)
+    temp_cmd_match = _find_temp_payload_in_command_line(cmd_lower)
+    if event.event_id in (1, 4688):
         for temp_path in config.SUSPICIOUS_TEMP_PATHS:
             tp_lower = temp_path.lower()
-            if tp_lower in img_lower:
+            if tp_lower in img_lower and not is_uv_python:
                 if any(img_lower.endswith(ext) for ext in config.SUSPICIOUS_EXTENSIONS):
                     reasons.append(f"一時・不審ディレクトリからの実行ファイル起動 ({event.image})")
                 else:
                     reasons.append(f"一時・不審ディレクトリ内のプロセスイメージ起動 ({event.image})")
-            elif tp_lower in cmd_lower:
-                if any(ext in cmd_lower for ext in config.SUSPICIOUS_EXTENSIONS):
-                    reasons.append(
-                        f"コマンドラインが一時・不審ディレクトリ内のスクリプト/実行ファイルを参照 ({temp_path})"
-                    )
+        if temp_cmd_match:
+            reasons.append(
+                f"コマンドラインが一時・不審ディレクトリ内のスクリプト/実行ファイルを参照 ({temp_cmd_match})"
+            )
 
     # 条件3: Sysmon Event ID 3 (ネットワーク接続) の一次スクリーニング
     if event.event_id == 3 and event.destination_ip:
@@ -749,9 +834,14 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
                     f"LOLBin/スクリプトホスト ({image_basename}) による外部通信 "
                     f"({event.destination_ip}:{event.destination_port})"
                 )
-            elif any(tp.lower() in img_lower for tp in config.SUSPICIOUS_TEMP_PATHS):
+            elif any(tp.lower() in img_lower for tp in config.SUSPICIOUS_TEMP_PATHS) and not is_uv_python:
                 reasons.append(
                     f"一時ディレクトリ上のプロセスによる外部通信 "
+                    f"({event.destination_ip}:{event.destination_port})"
+                )
+            elif is_uv_python and temp_cmd_match:
+                reasons.append(
+                    f"uv Python が一時ディレクトリ上のスクリプトから外部通信 "
                     f"({event.destination_ip}:{event.destination_port})"
                 )
 
@@ -766,6 +856,20 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
     # 重複理由を順序維持で除外
     deduped_reasons = list(dict.fromkeys(reasons))
     event.screening_reasons = deduped_reasons
+
+    # ホワイトリスト (allowlist.json) 照合: 改ざん・注入・LSASSアクセス等以外の許可ルールを除外
+    if deduped_reasons:
+        is_allowed, allow_reason = allowlist.is_event_allowlisted(event)
+        if is_allowed:
+            logger.debug(
+                "許可リスト一致のためスキップ (EventID=%d, RecordID=%d): %s",
+                event.event_id,
+                event.event_record_id,
+                allow_reason,
+            )
+            event.screening_reasons = []
+            return (False, [])
+
     return (len(deduped_reasons) > 0, deduped_reasons)
 
 

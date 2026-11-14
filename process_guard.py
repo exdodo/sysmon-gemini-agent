@@ -27,6 +27,7 @@ import tkinter as tk
 from tkinter import messagebox, scrolledtext
 from typing import Any
 
+import allowlist
 import config
 from event_reader import NormalizedEvent
 
@@ -702,6 +703,25 @@ def _run_dialog_window(
             except Exception as exc:
                 logger.warning("レポートを開けませんでした: %s", exc)
 
+        def on_add_allowlist() -> None:
+            ok, _, rule_val, preview_msg = allowlist.extract_rule_candidate(event)
+            if not ok:
+                messagebox.showwarning("許可リスト登録不可", preview_msg, parent=root)
+                return
+            if not messagebox.askyesno(
+                "許可リスト (ホワイトリスト) 登録確認",
+                f"このプログラムを無害な許可リストに追加しますか？\n\n{preview_msg}\n\n"
+                "※登録後、改ざん検知・注入・LSASSアクセス以外の通常監視から除外されます。",
+                parent=root,
+            ):
+                return
+            added, _, result_msg = allowlist.add_rule_for_event(event)
+            if added:
+                status_var.set(f"✅ 許可リスト登録済み: {rule_val}")
+                messagebox.showinfo("登録完了", result_msg, parent=root)
+            else:
+                messagebox.showwarning("登録スキップ", result_msg, parent=root)
+
         # アクションボタンバー
         btn_frame = tk.Frame(root, bg="#1E1E2E", padx=12, pady=10)
         btn_frame.pack(fill=tk.X)
@@ -776,6 +796,20 @@ def _run_dialog_window(
             pady=6,
         )
         btn_report.pack(side=tk.LEFT, padx=6)
+
+        btn_allowlist = tk.Button(
+            btn_frame,
+            text="✅ 許可リスト追加",
+            command=on_add_allowlist,
+            bg="#047857",
+            fg="#FFFFFF",
+            activebackground="#065F46",
+            activeforeground="#FFFFFF",
+            font=("Yu Gothic UI", 9, "bold"),
+            padx=10,
+            pady=6,
+        )
+        btn_allowlist.pack(side=tk.LEFT, padx=6)
 
         btn_close = tk.Button(
             btn_frame,

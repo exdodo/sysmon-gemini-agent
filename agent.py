@@ -201,8 +201,37 @@ class GeminiTriageAgent:
 
     @staticmethod
     def _extract_severity(report_text: str) -> str:
-        """レポート本文から `[CRITICAL]`, `[SUSPICIOUS]`, `[CLEAN]` を抽出します。"""
-        upper_text = report_text.upper()
+        """
+        レポート本文から最終評価レベル (`[CRITICAL]`, `[SUSPICIOUS]`, `[CLEAN]`) を抽出します。
+        説明文中の否定表現（例: 「現時点で [CRITICAL] と断定する悪性挙動はない」）に誤反応しないよう、
+        判定レベル宣言行および先頭付近の見出し行を最優先で解析します。
+        """
+        lines = [line.strip() for line in (report_text or "").splitlines() if line.strip()]
+
+        # 1. 「判定レベル」「評価レベル」を含む宣言行を最優先で確認
+        for line in lines[:10]:
+            upper_line = line.upper()
+            if "判定レベル" in line or "評価レベル" in line:
+                for sev in (
+                    config.SEVERITY_CRITICAL,
+                    config.SEVERITY_SUSPICIOUS,
+                    config.SEVERITY_CLEAN,
+                ):
+                    if sev in upper_line:
+                        return sev
+
+        # 2. 先頭付近の見出し行・単独タグ行から評価レベルを抽出
+        tag_line_re = re.compile(
+            r"^\s*(?:[#>*\-\s]|\*\*)*(\[(CRITICAL|SUSPICIOUS|CLEAN)\])",
+            re.IGNORECASE,
+        )
+        for line in lines[:8]:
+            m = tag_line_re.match(line)
+            if m:
+                return m.group(1).upper()
+
+        # 3. いずれにも該当しない場合のフォールバック
+        upper_text = (report_text or "").upper()
         if config.SEVERITY_CRITICAL in upper_text:
             return config.SEVERITY_CRITICAL
         if config.SEVERITY_SUSPICIOUS in upper_text:

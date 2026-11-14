@@ -8,15 +8,18 @@ Google Gemini (Function Calling) が不審イベントのコンテキストを�
 
 from __future__ import annotations
 
+from datetime import datetime, timezone
 import logging
 from typing import Any
 
 import config
 from event_reader import (
+    HAS_PSUTIL,
     HAS_PYWIN32,
     NormalizedEvent,
     get_cached_events,
     parse_event_xml,
+    psutil,
     register_event_in_cache,
     win32evtlog,
 )
@@ -166,6 +169,29 @@ def get_parent_process(parent_process_id: int) -> dict:
                 "DestinationIp": "",
                 "DestinationPort": None,
             }
+
+    # 5. ログローテーション済みで過去の起動ログが残っていない場合、稼働中プロセスを Read-Only 照会
+    if HAS_PSUTIL and psutil is not None and target_pid > 4:
+        try:
+            proc = psutil.Process(target_pid)
+            exe_path = proc.exe() or proc.name() or ""
+            cmdline_str = " ".join(proc.cmdline() or [])
+            ppid = proc.ppid()
+            create_utc = datetime.fromtimestamp(
+                proc.create_time(), tz=timezone.utc
+            ).strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+            return {
+                "UtcTime": create_utc,
+                "ProcessId": target_pid,
+                "Image": exe_path,
+                "CommandLine": cmdline_str,
+                "ParentProcessId": ppid,
+                "ParentCommandLine": "",
+                "DestinationIp": "",
+                "DestinationPort": None,
+            }
+        except Exception:
+            pass
 
     # 見つからなかった場合も同一スキーマの空データを返却
     return {

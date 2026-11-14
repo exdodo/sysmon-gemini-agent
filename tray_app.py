@@ -20,6 +20,7 @@ import time
 from typing import Any
 
 from agent import GeminiTriageAgent
+import allowlist
 import config
 from event_reader import CheckpointManager, NormalizedEvent, WindowsEventReader
 from process_guard import show_critical_response_dialog, verify_target_process
@@ -153,6 +154,7 @@ class SysmonTrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("今すぐ巡回を実行", self._on_scan_now),
             pystray.MenuItem("直近のCRITICAL迎撃パネル (Suspend/Kill) を開く", self._on_open_critical_dialog),
+            pystray.MenuItem("許可リスト (allowlist.json) を開く", self._on_open_allowlist),
             pystray.MenuItem("アラート出力フォルダ (alerts) を開く", self._on_open_alerts_dir),
             pystray.MenuItem("実行ログ (agent_runtime.log) を開く", self._on_open_runtime_log),
             pystray.MenuItem("アイコンを正常色（緑）にリセット", self._on_reset_status),
@@ -207,6 +209,14 @@ class SysmonTrayApp:
             os.startfile(str(config.ALERTS_DIR))
         except Exception as exc:
             logger.warning("alerts フォルダを開けませんでした: %s", exc)
+
+    def _on_open_allowlist(self, icon: Any, item: Any) -> None:
+        """許可リストファイル (allowlist.json) を生成（未作成時）して既定のエディタで開きます。"""
+        try:
+            path = allowlist.ensure_allowlist_file()
+            os.startfile(str(path))
+        except Exception as exc:
+            logger.warning("許可リスト (allowlist.json) を開けませんでした: %s", exc)
 
     def _on_open_runtime_log(self, icon: Any, item: Any) -> None:
         """実行ログファイル (alerts/agent_runtime.log) を既定のエディタで開きます（Read-Only表示）。"""
