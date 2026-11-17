@@ -13,7 +13,7 @@ from pathlib import Path
 # ============================================================================
 # アプリケーションバージョン定義 (機能追加時に更新し、CHANGELOG.md / Gitタグと同期)
 # ============================================================================
-APP_VERSION: str = "1.14"
+APP_VERSION: str = "1.15"
 
 # ============================================================================
 # パス設定 (ワークスペース内に閉じた設計・親ディレクトリへのアクセス禁止)
@@ -330,7 +330,18 @@ TRIMMED_EVENT_FIELDS: tuple[str, ...] = (
     "DestinationPort",
 )
 
-# API レート制限 (429 / ResourceExhausted) および通信障害時の Exponential Backoff 設定
+# Gemini API サービスティア & HTTP タイムアウト設定
+# [SUSPICIOUS] 候補は Flex ティア (コスト50%オフ)、[CRITICAL] 候補は即時応答のため通常ティアを使用
+GEMINI_SERVICE_TIER: str = os.environ.get("GEMINI_SERVICE_TIER", "").strip().lower() or "flex"
+GEMINI_CRITICAL_SERVICE_TIER: str = (
+    os.environ.get("GEMINI_CRITICAL_SERVICE_TIER", "").strip().lower() or "standard"
+)
+GEMINI_FALLBACK_SERVICE_TIER: str = "standard"
+FLEX_HTTP_TIMEOUT_MS: int = 300_000        # Flex ティア向け待機許容タイムアウト (300,000 ms = 5分)
+STANDARD_HTTP_TIMEOUT_MS: int = 60_000     # 標準ティア向けタイムアウト (60,000 ms = 1分)
+FLEX_FALLBACK_TO_STANDARD: bool = True     # Flex リトライ上限到達時に standard へ自動切替
+
+# API レート制限 (429 / 503 / ResourceExhausted) および通信障害時の Exponential Backoff 設定
 MAX_API_RETRIES: int = 4
 INITIAL_BACKOFF_SECONDS: float = 2.0
 BACKOFF_MULTIPLIER: float = 2.0

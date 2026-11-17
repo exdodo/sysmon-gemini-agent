@@ -84,6 +84,9 @@ class GeminiTriageAgent:
         self.alerts_dir: Path = alerts_dir
         self.alerts_dir.mkdir(parents=True, exist_ok=True)
         self._last_model_refresh_ts: float = 0.0
+        self.last_used_service_tier: str = (
+            "offline" if self.offline_only else config.GEMINI_SERVICE_TIER
+        )
         self._last_cleanup_date: str = datetime.now().astimezone().strftime("%Y%m%d")
         cleanup_old_incident_reports(alerts_dir=self.alerts_dir)
         self.triage_cache: CleanTriageCache | None = (
@@ -111,7 +114,10 @@ class GeminiTriageAgent:
             )
 
         # 公式 google-genai SDK の Client 初期化 (環境変数 GEMINI_API_KEY を自動参照)
-        self.client = genai.Client()
+        # Flex ティア待機に対応するため長めの HTTP タイムアウト (既定 300,000 ms = 5分) を設定
+        self.client = genai.Client(
+            http_options=types.HttpOptions(timeout=config.FLEX_HTTP_TIMEOUT_MS)
+        )
         requested_model = (model_name or "").strip() or "auto"
         self.auto_model_enabled: bool = requested_model.lower() == "auto"
         self.model_name: str = (
@@ -121,9 +127,32 @@ class GeminiTriageAgent:
         if self.auto_model_enabled:
             self.refresh_latest_model(force=True)
 
+    @staticmethod
+    def _is_retryable_api_error(api_err: Exception) -> bool:
+        """429/503 等の混雑エラーやタイムアウトが一時的な再試行対象かを判定します。"""
+        status_code = getattr(api_err, "code", None)
+        if status_code in (408, 429, 500, 502, 503, 504):
+            return True
+        err_msg = str(api_err).lower()
+        return any(
+            token in err_msg
+            for token in (
+                "resource_exhausted",
+                "resourceexhausted",
+                "rate limit",
+                "quota",
+                "unavailable",
+                "overloaded",
+                "deadline_exceeded",
+                "deadline exceeded",
+                "timed out",
+                "timeout",
+            )
+        )
+
     def _call_with_exponential_backoff(self, func: Any, *args: Any, **kwargs: Any) -> Any:
         """
-        APIレート制限 (429 / ResourceExhausted) や一時的な通信障害発生時に
+        APIレート制限 (429 / 503 / ResourceExhausted) や一時的な通信障害・タイムアウト発生時に
         指数バックオフ (Exponential Backoff + Jitter) で安全にリトライします。
         """
         backoff = config.INITIAL_BACKOFF_SECONDS
@@ -135,14 +164,7 @@ class GeminiTriageAgent:
             except APIError as api_err:
                 last_exception = api_err
                 status_code = getattr(api_err, "code", None)
-                err_msg = str(api_err).lower()
-                is_retryable = (
-                    status_code in (429, 500, 502, 503, 504)
-                    or "resource_exhausted" in err_msg
-                    or "resourceexhausted" in err_msg
-                    or "rate limit" in err_msg
-                    or "quota" in err_msg
-                )
+                is_retryable = self._is_retryable_api_error(api_err)
                 if not is_retryable or attempt == config.MAX_API_RETRIES:
                     logger.error(
                         "Gemini API エラー (試行 %d/%d, status=%s): %s",
@@ -435,13 +457,43 @@ class GeminiTriageAgent:
                 return True
         return False
 
+    @staticmethod
+    def _resolve_http_timeout_ms(service_tier: str) -> int:
+        return (
+            config.FLEX_HTTP_TIMEOUT_MS
+            if service_tier == "flex"
+            else config.STANDARD_HTTP_TIMEOUT_MS
+        )
+
+    @staticmethod
+    def _build_generate_config(
+        service_tier: str,
+        disable_tools: bool = False,
+    ) -> Any:
+        kwargs: dict[str, Any] = {
+            "system_instruction": SYSTEM_INSTRUCTION,
+            "tools": AVAILABLE_TOOLS,
+            "automatic_function_calling": types.AutomaticFunctionCallingConfig(disable=True),
+            "temperature": 0.1,
+            "service_tier": service_tier,
+            "http_options": types.HttpOptions(
+                timeout=GeminiTriageAgent._resolve_http_timeout_ms(service_tier)
+            ),
+        }
+        if disable_tools:
+            kwargs["tool_config"] = types.ToolConfig(
+                function_calling_config=types.FunctionCallingConfig(mode="NONE")
+            )
+        return types.GenerateContentConfig(**kwargs)
+
     def _run_chat_triage_loop(
         self,
         prompt: str,
-        base_config: Any,
+        service_tier: str = config.GEMINI_SERVICE_TIER,
     ) -> tuple[str, int, list[dict[str, Any]]]:
-        """現在の `self.model_name` を使って Function Calling ループを実行します。"""
+        """現在の `self.model_name` と指定 `service_tier` を使って Function Calling ループを実行します。"""
         tool_trace: list[dict[str, Any]] = []
+        base_config = self._build_generate_config(service_tier=service_tier, disable_tools=False)
         chat = self.client.chats.create(
             model=self.model_name,
             config=base_config,
@@ -496,14 +548,9 @@ class GeminiTriageAgent:
                     "最大調査ループ上限 (max_depth=%d) に到達したため、最終トリアージ判定を生成します。",
                     self.max_depth,
                 )
-                final_turn_config = types.GenerateContentConfig(
-                    system_instruction=SYSTEM_INSTRUCTION,
-                    tools=AVAILABLE_TOOLS,
-                    automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-                    tool_config=types.ToolConfig(
-                        function_calling_config=types.FunctionCallingConfig(mode="NONE")
-                    ),
-                    temperature=0.1,
+                final_turn_config = self._build_generate_config(
+                    service_tier=service_tier,
+                    disable_tools=True,
                 )
                 response = self._call_with_exponential_backoff(
                     chat.send_message,
@@ -637,27 +684,41 @@ class GeminiTriageAgent:
             return False
         return time.monotonic() >= self._api_offline_until
 
+    @classmethod
+    def _select_initial_service_tier(cls, event: NormalizedEvent) -> tuple[str, str]:
+        """
+        一次スクリーニング時の事前リスク評価に基づき Gemini API のサービスティアを決定します。
+        - `[CRITICAL]` 候補: 即時応答を優先し通常ティア (`standard`)
+        - `[SUSPICIOUS]` 候補: コスト削減を優先し Flex ティア (`flex`)
+        """
+        pre_severity = cls.classify_offline_severity(event)
+        if pre_severity == config.SEVERITY_CRITICAL:
+            return config.GEMINI_CRITICAL_SERVICE_TIER, pre_severity
+        return config.GEMINI_SERVICE_TIER, pre_severity
+
     def _execute_gemini_triage_with_model_fallback(
         self,
         event: NormalizedEvent,
     ) -> tuple[str, int, list[dict[str, Any]]]:
-        """自動モデル更新・404時後継切替を含めて Gemini 自律調査ループを実行します。"""
+        """自動モデル更新・404時後継切替・Flexリトライ上限時standard切替を含めて Gemini 自律調査ループを実行します。"""
         if self.auto_model_enabled:
             self.refresh_latest_model(force=False)
 
         prompt = self._build_initial_prompt(event)
-
-        # 自動Function Callingを無効化し、明示的な max_depth ループで完全制御する
-        base_config = types.GenerateContentConfig(
-            system_instruction=SYSTEM_INSTRUCTION,
-            tools=AVAILABLE_TOOLS,
-            automatic_function_calling=types.AutomaticFunctionCallingConfig(disable=True),
-            temperature=0.1,
-        )
+        initial_tier, pre_severity = self._select_initial_service_tier(event)
+        tiers_to_try = [initial_tier]
+        if (
+            config.FLEX_FALLBACK_TO_STANDARD
+            and initial_tier == "flex"
+            and config.GEMINI_FALLBACK_SERVICE_TIER not in tiers_to_try
+        ):
+            tiers_to_try.append(config.GEMINI_FALLBACK_SERVICE_TIER)
 
         logger.info(
-            "Gemini 自律調査を開始します: Model=%s, Channel=%s, EventID=%d, RecordID=%d (max_depth=%d)",
+            "Gemini 自律調査を開始します: Model=%s, PreSeverity=%s, Tier=%s, Channel=%s, EventID=%d, RecordID=%d (max_depth=%d)",
             self.model_name,
+            pre_severity,
+            tiers_to_try[0],
             event.channel,
             event.event_id,
             event.event_record_id,
@@ -670,19 +731,44 @@ class GeminiTriageAgent:
         depth = 0
         tool_trace: list[dict[str, Any]] = []
 
-        for attempt_idx in range(max_fallback_attempts + 1):
-            tried_models.add(self.model_name)
+        for tier_idx, service_tier in enumerate(tiers_to_try):
+            has_next_tier = tier_idx + 1 < len(tiers_to_try)
             try:
-                report_text, depth, tool_trace = self._run_chat_triage_loop(prompt, base_config)
-                self._api_offline_until = 0.0
+                for attempt_idx in range(max_fallback_attempts + 1):
+                    tried_models.add(self.model_name)
+                    try:
+                        report_text, depth, tool_trace = self._run_chat_triage_loop(
+                            prompt, service_tier=service_tier
+                        )
+                        self.last_used_service_tier = service_tier
+                        self._api_offline_until = 0.0
+                        break
+                    except APIError as api_err:
+                        if (
+                            attempt_idx < max_fallback_attempts
+                            and self._is_model_unavailable_error(api_err)
+                            and self._switch_to_fallback_model(str(api_err), tried_models=tried_models)
+                        ):
+                            continue
+                        raise
                 break
-            except APIError as api_err:
-                if (
-                    attempt_idx < max_fallback_attempts
-                    and self._is_model_unavailable_error(api_err)
-                    and self._switch_to_fallback_model(str(api_err), tried_models=tried_models)
-                ):
+            except Exception as tier_exc:
+                is_congestion_or_net = isinstance(
+                    tier_exc, (ConnectionError, TimeoutError, OSError)
+                ) or (isinstance(tier_exc, APIError) and self._is_retryable_api_error(tier_exc))
+                if has_next_tier and is_congestion_or_net:
+                    logger.warning(
+                        "サービスティア '%s' でリトライ上限に到達したため、標準ティア '%s' へフォールバックします: %s",
+                        service_tier,
+                        tiers_to_try[tier_idx + 1],
+                        tier_exc,
+                    )
                     continue
+                logger.warning(
+                    "サービスティア '%s' での実行が失敗しました（次回巡回へ繰り越しまたはオフラインフォールバック）: %s",
+                    service_tier,
+                    tier_exc,
+                )
                 raise
 
         if not report_text:
@@ -758,6 +844,7 @@ class GeminiTriageAgent:
             "report_file": str(report_file),
             "offline_fallback": False,
             "reconciled_from_offline": True,
+            "service_tier": self.last_used_service_tier,
         }
 
     def investigate_event(self, event: NormalizedEvent) -> dict[str, Any]:
@@ -826,6 +913,7 @@ class GeminiTriageAgent:
             "report_text": report_text,
             "report_file": str(report_file),
             "offline_fallback": False,
+            "service_tier": self.last_used_service_tier,
         }
 
     def append_triage_report(
@@ -853,7 +941,7 @@ class GeminiTriageAgent:
         trimmed = event.to_trimmed_dict()
         reasons_md = "\n".join(f"  - {r}" for r in event.screening_reasons) or "  - 一次フィルタ一致"
         proc_check = verify_target_process(event.process_id, event.image, event.utc_time)
-        used_model = model_label or self.model_name
+        used_model = model_label or f"{self.model_name} (tier: {self.last_used_service_tier})"
 
         if tool_trace:
             trace_lines = []

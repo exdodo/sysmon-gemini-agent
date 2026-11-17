@@ -2,6 +2,18 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.15] - 2026-11-18
+`[SUSPICIOUS]` 候補への Gemini Flex ティア（`service_tier="flex"`）適用による API コスト50%削減、`[CRITICAL]` 候補の通常ティア即時優先、長時間タイムアウト（`HttpOptions(timeout=300000)`）、および混雑・上限到達時の `standard` 自動フォールバックを実装。
+
+### 追加・改善
+- **事前リスク別サービスティア自動振り分け (`agent.py`, `config.py`)**:
+  - `_select_initial_service_tier()` により、第1層の事前リスク評価が `[SUSPICIOUS]` 相当のイベントにはコスト半額の `service_tier="flex"`（`FLEX_HTTP_TIMEOUT_MS = 300_000` ms = 5分）、`[CRITICAL]` 相当（`[CRITICAL候補]`・改ざん・注入・LSASSアクセス・高危険キーワード等）のイベントには即時応答優先の `service_tier="standard"`（`STANDARD_HTTP_TIMEOUT_MS = 60_000` ms）を自動選択。
+  - `_build_generate_config()` を共通化し、初期ターンおよび `max_depth` 到達時の最終ターン双方へ `service_tier` と `HttpOptions(timeout=...)` を確実に適用。
+- **Flex 向けリトライ強化＆標準ティア自動フォールバック (`agent.py`, `config.py`)**:
+  - `genai.Client(http_options=types.HttpOptions(timeout=300000))` でクライアントを初期化し、`_is_retryable_api_error()` で `408 / 429 / 500 / 502 / 503 / 504`・`unavailable`・`overloaded`・`deadline_exceeded`・`timeout` に対する指数バックオフリトライを拡充。
+  - Flex ティアでリトライ上限に達した場合は自動で `service_tier="standard"` へフォールバックし、標準ティアも到達不能な場合はローカルフォールバック＋次回巡回再判定キューへ繰り越し。
+  - レポート内の「使用AIモデル」行および返却結果へ実際に使用されたティア（`(tier: flex)` / `(tier: standard)`）を明記。
+
 ## [1.14] - 2026-11-15
 `[CLEAN]` 判定キャッシュによる重複 API 問い合わせ抑止、`[CLEAN]` 回答の短文出力化によるトークン削減、および過去ログ・レポートの容量/期間ローテーションを実装。
 
