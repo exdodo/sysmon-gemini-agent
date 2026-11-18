@@ -1,6 +1,6 @@
 # Windows Event Log & Sysmon 監視エージェント (Google Gemini版)
 
-> **Version**: `1.15`（変更履歴は [CHANGELOG.md](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/CHANGELOG.md) を参照）
+> **Version**: `1.16`（変更履歴は [CHANGELOG.md](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/CHANGELOG.md) を参照）
 
 Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, `System`）を定期巡回し、**ルールベースの一次スクリーニング**と **Google Gemini (`google-genai` SDK) の自律調査ループ（Function Calling）**、および **オフライン・API障害時のローカル即時フォールバック判定** を組み合わせて、不審なプロセス・インジェクション・永続化・外部通信の兆候を安全かつ低コストにトリアージする監視エージェントです。
 
@@ -34,9 +34,9 @@ Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, 
    - **`[CLEAN]` 判定キャッシュ & 短文出力によるAPIコスト最適化**:
      - Gemini により `[CLEAN]` と判定された安全なイベントパターンを正規化フィンガープリントで `triage_cache.json` に保存（有効期限 24 時間）し、期間内の同一パターン再検出時は Gemini API 問い合わせおよび `incident_YYYYMMDD.md` への重複追記をスキップします（`agent_runtime.log` にのみ記録）。
      - 改ざん検知・注入（ID 8）・LSASSアクセス（ID 10）・危険キーワード・ログオン失敗（ID 4625）・`[SUSPICIOUS]`/`[CRITICAL]` 判定は安全ガードによりキャッシュ対象外とし、毎回必ず検査します。
-     - 新規パターンの問い合わせ時も、`[CLEAN]` 判定時は出力トークン節約のため「判定レベル＋1行の簡潔な根拠のみ」の短文で回答します（`[SUSPICIOUS]`/`[CRITICAL]` 時は従来通り詳細レポートを出力）。
+     - 新規パターンの問い合わせ時も、入出力双方で Markdown 装飾・冗長な挨拶・JSON インデント空白を省いたプレーンテキスト形式でやり取りしてトークンを削減します（`[CLEAN]` 判定時は「判定レベル＋1行の簡潔な根拠のみ」の2行出力）。
    - **オフライン / API障害フォールバック**: Gemini API への接続失敗・レート制限超過・タイムアウト時は、ローカルルールによる緊急判定（`[CRITICAL]` / `[SUSPICIOUS]`）へ自動切替し、`alerts/incident_YYYYMMDD.md` への記録、トレイ通知・色変化、Microsoft Defender 緊急スキャン通報、CRITICAL迎撃ダイアログ表示を途切れさせません（`--offline` オプションによる完全オフライン監視も可能）。
-   - **トークン最適化（Trimming）**: 生のイベントXML全体は送信せず、重要8フィールド（`UtcTime`, `ProcessId`, `Image`, `CommandLine`, `ParentProcessId`, `ParentCommandLine`, `DestinationIp`, `DestinationPort`）のみを辞書形式でプロンプトに渡します。
+   - **トークン最適化（Trimming）**: 生のイベントXML全体は送信せず、重要8フィールド（`UtcTime`, `ProcessId`, `Image`, `CommandLine`, `ParentProcessId`, `ParentCommandLine`, `DestinationIp`, `DestinationPort`）のみをコンパクト JSON 形式のプレーンテキストプロンプトで渡します。
    - **自律調査ツール（完全Read-Only）**:
      - `get_parent_process(parent_process_id: int) -> dict`: 親プロセスの実行イメージとコマンドラインを取得。
      - `get_process_network_activity(process_id: int) -> list[dict]`: 対象プロセスが行った外部通信（Sysmon ID 3）およびDNSクエリ（ID 22）を取得。

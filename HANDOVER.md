@@ -1,10 +1,10 @@
 # HANDOVER.md — `sysmon-gemini-agent` 引き継ぎドキュメント
 
-> **最終更新日**: 2026-11-15  
+> **最終更新日**: 2026-11-19  
 > **引き継ぎ元会話**: `Windows Event Log Gemini Monitor`（Conversation ID: `0cd84d29-4734-4dfb-a25f-e34228e217dd`、2026-11-11 〜 2026-11-14）  
 > **対象ワークスペース**: `c:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent`  
 > **リモートリポジトリ**: `https://github.com/exdodo/sysmon-gemini-agent.git`（`main` / `origin/main`）  
-> **現在のリポジトリ最新状態**: `v1.14`（コミット `3025b4d`、ローカル・リモート同期済み。引き継ぎ元スレッドでは `v1.00` 〜 `v1.13` までを実装し、その後の追補で `v1.14` が反映済み）
+> **現在のリポジトリ最新状態**: `v1.16`（入出力プレーンテキスト最適化。ローカルコミット・タグ作成済み／`v1.15` 以降のリモート `git push` 状況に留意）
 
 ---
 
@@ -57,6 +57,8 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 | `v1.12` (`3295cb4`)<br>& `allowlist.json` (`f4f6cb7`) | 2026-11-14 | ・**ホットリロード対応ホワイトリスト (`allowlist.py`)**: `allowlist.json` による除外、迎撃パネル「許可リスト追加」ボタン、トレイメニュー連携（改ざん・ID `8`/ID `10`・危険キーワードはバイパス禁止ガード付き）。<br>・`uv` 管理 Python ランタイム誤検知抑制、自己 PID 除外、`psutil` による ID `3`/親プロセス補完、`_extract_severity()` 否定文脈誤拾い修正。<br>・ユーザー指示により `C:\Users\Yusuke\.gemini\antigravity\scratch\` 配下の常駐 Python サービス群（`StockPriceDL`, `xbrl_dl` 等）を `allowlist.json` の `trusted_image_prefixes` に登録。 |
 | `v1.13` (`6513baa`) | 2026-11-14 | ・**複数行見出し・バッククォート抽出バグ修正**: `### 判定レベル\n\`[SUSPICIOUS]\`` 形式の応答で本文中の `[CRITICAL]` 否定表現を誤認識して迎撃パネルが開く不具合を修正。<br>・オフライン判定時の `uv` Python 過剰 `[CRITICAL]` 昇格抑止、同一 PID 120秒以内の迎撃ダイアログ連続ポップアップ抑止を追加。 |
 | `v1.14` (`3025b4d`)<br>*(別ターンで反映済)* | 2026-11-15 | ・`triage_cache.py` による `[CLEAN]` 24時間 SHA-256 キャッシュ（高リスク/改ざんイベントはキャッシュ除外）。<br>・`[CLEAN]` 時 AI 回答の短文化、`log_retention.py` ＆ `RotatingFileHandler`（5 MB × 5 世代 / 30 日 / 100 MB 上限）を実装。 |
+| `v1.15` (`7e32a7c`) | 2026-11-18 | ・事前リスク別サービスティア振り分け（`[SUSPICIOUS]` 候補はコスト半額の `service_tier="flex"` / 300秒タイムアウト、`[CRITICAL]` 候補は `standard` 即時優先）および混雑時 `standard` 自動フォールバックを実装。 |
+| `v1.16` | 2026-11-19 | ・Gemini 入出力のプレーンテキスト統一（Markdown 装飾 `#`, `**`, `*`, `---` や挨拶の抑止、`_build_initial_prompt` のコンパクト JSON＋プレーンテキスト化）、オフライン/空応答出力の統一、`summarize_clean_report()` の `・` 除去対応を実装。 |
 
 ---
 
@@ -64,7 +66,7 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 
 | ファイル | 役割 |
 | :--- | :--- |
-| `config.py` | `APP_VERSION = "1.14"`、監視対象チャネル/ID、一次スクリーニング条件、Gemini モデル設定、`MAX_DEPTH = 3`、キャッシュ/ログ保持設定、保護プロセス一覧 |
+| `config.py` | `APP_VERSION = "1.16"`、監視対象チャネル/ID、一次スクリーニング条件、Gemini モデル設定、`MAX_DEPTH = 3`、キャッシュ/ログ保持設定、保護プロセス一覧 |
 | `event_reader.py` | `win32evtlog` Read-Only 収集、XML パース（`EventData`/`UserData`）、一次スクリーニング、`EventRecordID` 巻き戻り復旧、サービス死活監視、`checkpoint.json` 管理 |
 | `allowlist.py` | ホットリロード対応 `allowlist.json` 判定、高リスクイベントバイパス禁止ガード、GUI 登録候補抽出 |
 | `triage_cache.py` | `[CLEAN]` 判定パターンの正規化 SHA-256 フィンガープリント生成・24時間永続キャッシュ（`triage_cache.json`） |

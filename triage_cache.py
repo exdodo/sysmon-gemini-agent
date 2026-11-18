@@ -116,7 +116,7 @@ def summarize_clean_report(report_text: str, max_chars: int = 160) -> str:
         line = raw_line.strip()
         if not line or line in ("---", "### Gemini 分析・判定結果"):
             continue
-        cleaned = re.sub(r"^[-*#\s`]+", "", line)
+        cleaned = re.sub(r"^[-*・#\s`]+", "", line)
         if not cleaned or cleaned.upper() == "[CLEAN]":
             continue
         if cleaned.startswith("判定レベル"):

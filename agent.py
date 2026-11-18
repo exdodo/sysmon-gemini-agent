@@ -41,23 +41,29 @@ from triage_cache import CleanTriageCache
 logger = logging.getLogger("sysmon_gemini_agent.agent")
 
 SYSTEM_INSTRUCTION = """あなたはWindowsセキュリティ監視（SOC）の専門トリアージAIエージェントです。
-ルールベース一次スクリーニングで抽出されたWindowsイベントログ（Sysmon / Security / System）の不審候補について、
-提供されたRead-Onlyツール（`get_parent_process`, `get_process_network_activity`, `get_process_related_events`）を必要最小限の回数だけ呼び出して自律調査を行い、最終的なトリアージ判定レポートを日本語のMarkdownで出力してください。
+一次スクリーニングを通過したWindowsイベントログ（Sysmon / Security / System）の不審候補について、必要最小限の回数だけRead-Onlyツール（get_parent_process, get_process_network_activity, get_process_related_events）を呼び出して調査し、日本語のプレーンテキストのみで簡潔にトリアージ結果を出力してください。
 
-【厳守事項】
-1. 調査ループは最大3往復（max_depth = 3）に制限されています。必要な場合のみ `ParentProcessId` から親プロセスを辿るか、`ProcessId` から外部通信・DNS（Sysmon ID 3/22）や関連挙動（スレッド注入 ID 8、LSASSアクセス ID 10、ファイル作成 ID 11、レジストリ変更 ID 12/13）を確認してください。
-2. 最終回答には必ず以下の3段階の評価レベルのいずれか1つを先頭行または見出しに明記してください:
-   - `[CLEAN]` : 正規の管理操作・OS標準動作・誤検知と判断できる場合
-   - `[SUSPICIOUS]` : 不審な兆候があるが単独では確定できず、管理者への確認・追加監視が必要な場合
-   - `[CRITICAL]` : 難読化コマンド実行、LOLBin悪用、不審な外部C2通信・DNSトンネリング、スレッド注入（ID 8）、LSASSメモリダンプ疑い（ID 10）、危険な永続化（ID 11/12/13）、権限昇格・侵害の強い兆候、または Sysmon 停止/設定改ざん/ログ消去（EventID 4, 16, 104, 1102, 4719, EventRecordID巻き戻り等）の防衛機能妨害（Defense Evasion）がある場合
-3. 最終回答の構成（出力コスト最適化のため `[CLEAN]` のみ極力短文で出力すること）:
-   - **`[CLEAN]` と判定する場合**（以下の2行のみ出力し、長文解説や推奨確認事項は出力しないこと）:
-     - **判定レベル**: `[CLEAN]`
-     - **判定理由**: （正規動作・誤検知と判断した簡潔な根拠を1文・80文字以内で記載）
-   - **`[SUSPICIOUS]` または `[CRITICAL]` と判定する場合**:
-     - **判定レベル**: `[SUSPICIOUS]` または `[CRITICAL]`
-     - **判定理由**: イベント内容およびツール調査結果に基づく具体的な根拠（箇条書き）
-     - **推奨確認事項**: セキュリティ担当者が次に確認すべき具体的な調査項目（箇条書き・すべて読み取り専用の確認手順とすること）
+出力ルール:
+・プレーンテキストのみで簡潔に出力してください。Markdown装飾（#、**、*、---）、前置き（「はい、承知しました」など）、結びの挨拶は一切出力しないでください。
+・バッククォートやコードブロックも使用しないでください。
+
+調査・判定ルール:
+1. 調査ループ上限は最大3往復（max_depth = 3）です。必要な場合のみ ParentProcessId から親プロセスを辿るか、ProcessId から外部通信・DNS（Sysmon ID 3/22）や関連挙動（スレッド注入 ID 8、LSASSアクセス ID 10、ファイル作成 ID 11、レジストリ変更 ID 12/13）を確認してください。
+2. 判定レベルは次のいずれか1つを先頭行に明記してください:
+・[CLEAN] : 正規の管理操作・OS標準動作・誤検知と判断できる場合
+・[SUSPICIOUS] : 不審な兆候があるが単独では確定できず、管理者への確認・追加監視が必要な場合
+・[CRITICAL] : 難読化コマンド実行、LOLBin悪用、不審な外部C2通信・DNSトンネリング、スレッド注入（ID 8）、LSASSメモリダンプ疑い（ID 10）、危険な永続化（ID 11/12/13）、権限昇格・侵害の強い兆候、または Sysmon 停止/設定改ざん/ログ消去（EventID 4, 16, 104, 1102, 4719, EventRecordID巻き戻り等）の防衛機能妨害（Defense Evasion）がある場合
+3. 出力形式（厳守）:
+[CLEAN] の場合（以下の2行のみ出力し、長文解説や推奨確認事項は出力しないこと）:
+判定レベル: [CLEAN]
+判定理由: 1文・80文字以内の簡潔な根拠
+
+[SUSPICIOUS] または [CRITICAL] の場合:
+判定レベル: [SUSPICIOUS] または [CRITICAL]
+判定理由:
+・イベント内容およびツール調査結果に基づく具体的な根拠
+推奨確認事項:
+・管理者が次に確認すべき読み取り専用の確認手順
 """
 
 
@@ -213,24 +219,18 @@ class GeminiTriageAgent:
     @staticmethod
     def _build_initial_prompt(event: NormalizedEvent) -> str:
         """
-        生XMLを一切含めず、トークン最適化された8フィールド辞書 (`to_trimmed_dict()`) と
-        一次スクリーニング検知理由のみを整形して初期プロンプトを生成します。
+        生XML・Markdown装飾・冗長な空白を省き、トークン最適化された8フィールド辞書
+        (`to_trimmed_dict()`) と一次スクリーニング検知理由のみをプレーンテキストで整形します。
         """
         trimmed_payload: dict[str, Any] = event.to_trimmed_dict()
-        reasons_str = "\n".join(f"- {r}" for r in event.screening_reasons) or "- 一次フィルタ条件一致"
+        reasons_str = " / ".join(event.screening_reasons) or "一次フィルタ条件一致"
 
         return (
-            "以下のWindowsイベントがルールベース一次スクリーニングで「不審候補」として検出されました。\n"
-            "必要に応じてツール（`get_parent_process`, `get_process_network_activity`, `get_process_related_events`）を呼び出して"
-            "親プロセスや外部通信・DNS・注入/永続化挙動の有無を確認し、トリアージ判定を行ってください。\n\n"
-            f"### メタ情報\n"
-            f"- Channel: `{event.channel}`\n"
-            f"- EventID: `{event.event_id}`\n"
-            f"- EventRecordID: `{event.event_record_id}`\n\n"
-            f"### 一次スクリーニング検知理由\n"
-            f"{reasons_str}\n\n"
-            f"### 抽出イベントデータ (Trimmed JSON)\n"
-            f"```json\n{json.dumps(trimmed_payload, indent=2, ensure_ascii=False)}\n```\n"
+            f"Channel: {event.channel}\n"
+            f"EventID: {event.event_id}\n"
+            f"EventRecordID: {event.event_record_id}\n"
+            f"検知理由: {reasons_str}\n"
+            f"イベントデータ: {json.dumps(trimmed_payload, ensure_ascii=False, separators=(',', ':'))}"
         )
 
     @staticmethod
@@ -632,23 +632,23 @@ class GeminiTriageAgent:
         """
         severity = self.classify_offline_severity(event)
         mode_note = (
-            "オフライン専用モード (`--offline`)"
+            "オフライン専用モード (--offline)"
             if self.offline_only
             else f"Gemini API 障害時ローカルフォールバック (理由: {error_reason or '通信不可'})"
         )
-        reasons_md = "\n".join(f"  - {r}" for r in event.screening_reasons) or "  - 一次スクリーニング条件一致"
+        reasons_plain = "\n".join(f"・{r}" for r in event.screening_reasons) or "・一次スクリーニング条件一致"
 
         report_text = (
-            f"{severity}\n"
-            f"- **実行モード**: ⚠️ {mode_note}\n"
-            "- **判定理由**:\n"
-            f"{reasons_md}\n"
-            "- **オフライン補足**: Gemini API への問い合わせが利用できないため、第1層ルールベース検知と"
+            f"判定レベル: {severity}\n"
+            f"実行モード: {mode_note}\n"
+            "判定理由:\n"
+            f"{reasons_plain}\n"
+            "・Gemini API への問い合わせが利用できないため、第1層ルールベース検知と"
             "イベント種別重要度に基づきローカルで緊急判定を実施しました。\n"
-            "- **推奨確認事項**:\n"
-            "  - `alerts/incident_YYYYMMDD.md` 内の対象プロセス・コマンドライン・通信先を確認してください。\n"
-            "  - `[CRITICAL]` 判定時は Microsoft Defender ローカルスキャン結果および迎撃パネルで生存確認を行ってください。\n"
-            "  - ネットワーク/API障害がマルウェアによる意図的な通信遮断でないか（ファイアウォール/HOSTS設定等）も確認してください。"
+            "推奨確認事項:\n"
+            "・alerts/incident_YYYYMMDD.md 内の対象プロセス・コマンドライン・通信先を確認してください。\n"
+            "・[CRITICAL] 判定時は Microsoft Defender ローカルスキャン結果および迎撃パネルで生存確認を行ってください。\n"
+            "・ネットワーク/API障害がマルウェアによる意図的な通信遮断でないか（ファイアウォール/HOSTS設定等）も確認してください。"
         )
         model_label = (
             "offline-rule-engine"
@@ -773,9 +773,11 @@ class GeminiTriageAgent:
 
         if not report_text:
             report_text = (
-                f"{config.SEVERITY_SUSPICIOUS}\n"
-                "- **判定理由**: Gemini からテキスト応答が返却されなかったため、一次スクリーニング結果に基づき要注意と判定しました。\n"
-                "- **推奨確認事項**: 該当プロセスの実行ファイルパスおよびコマンドライン引数を手動で確認してください。"
+                f"判定レベル: {config.SEVERITY_SUSPICIOUS}\n"
+                "判定理由:\n"
+                "・Gemini からテキスト応答が返却されなかったため、一次スクリーニング結果に基づき要注意と判定しました。\n"
+                "推奨確認事項:\n"
+                "・該当プロセスの実行ファイルパスおよびコマンドライン引数を手動で確認してください。"
             )
         return report_text, depth, tool_trace
 
@@ -826,7 +828,7 @@ class GeminiTriageAgent:
             self.triage_cache.store_clean(event, report_text)
 
         reconciled_report = (
-            "✅ **【オンライン復旧・Gemini API 再判定レポート】** "
+            "【オンライン復旧・Gemini API 再判定レポート】"
             "オフラインフォールバック後に通信が復旧したため、Gemini API による再評価を実行しました。\n\n"
             f"{report_text}"
         )
