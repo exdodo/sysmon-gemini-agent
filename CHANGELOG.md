@@ -2,6 +2,17 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.17] - 2026-11-19
+一次スクリーニングの不審キーワード判定を単純な部分一致から精密ルール（単語境界・PowerShell 引数パターン・正規 System32 `rundll32`/`regsvr32` 除外）へ刷新し、`msiexec.exe`（`iex` 部分一致）や Windows 標準 `rundll32.exe` による誤検知を解消。
+
+### 修正・改善
+- **精密キーワードマッチングモジュール新設 (`keyword_matcher.py`)**:
+  - `iex`: `msiexec.exe`・`iexplore.exe`・16進数/GUID 等に誤爆しないよう区切り条件（`(?:^|[\s"'(|;&`])iex(?=$|[\s("'`;|&])`）へ変更し、`iex (...)` / `| iex` / `invoke-expression` のみを正確に検知。
+  - `bypass` / `hidden` / `-enc`: `--proxy-bypass-list`・`--window-state=hidden`・`--encoding=utf-8` 等に誤爆しないよう PowerShell フラグ構文（`-ExecutionPolicy Bypass`, `-ep bypass`, `-WindowStyle Hidden`, `-w hidden`, `-enc` / `-EncodedCommand` / 長文 Base64 等）へ厳格化。
+  - `rundll32` / `regsvr32`: `C:\Windows\System32` / `SysWOW64` の正規実行ファイルが安全領域の標準 DLL/CPL（例: `AppXDeploymentExtensions.OneCore.dll,ShellRefresh`, `PcaSvc.dll`, `sysdm.cpl`, `shell32.dll`）を呼び出す場合は除外しつつ、一時/公開パス・UNC/URL・悪用実績のある LOLBin エントリポイント（`comsvcs.dll,MiniDump`, `mshtml,RunHTMLApplication`, `ShellExec_RunDLL`, `scrobj.dll` 等）は引き続き検知。
+- **重複ロジックの共通化 (`event_reader.py`, `agent.py`, `allowlist.py`)**:
+  - `screen_event()`・`_screen_registry_event()`・`classify_offline_severity()`・`is_high_risk_protected_event()` がすべて `keyword_matcher` を共通利用するよう統合し、誤って `msiexec.exe` 等が `[CRITICAL]` に昇格する問題もあわせて解消。
+
 ## [1.16] - 2026-11-19
 Gemini 入出力双方のプレーンテキスト化・簡素化による入出力トークン削減を実装。
 

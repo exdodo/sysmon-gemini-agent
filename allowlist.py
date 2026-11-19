@@ -21,6 +21,7 @@ import threading
 from typing import TYPE_CHECKING, Any
 
 import config
+import keyword_matcher
 
 if TYPE_CHECKING:
     from event_reader import NormalizedEvent
@@ -148,7 +149,7 @@ def is_high_risk_protected_event(event: NormalizedEvent) -> bool:
     ).lower()
     if "[critical候補]" in combined_lower:
         return True
-    if any(kw in combined_lower for kw in _NEVER_ALLOWLIST_KEYWORDS):
+    if keyword_matcher.has_never_allowlist_keyword(combined_lower):
         return True
     return False
 

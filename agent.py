@@ -33,6 +33,7 @@ except ImportError:
 
 import config
 from event_reader import NormalizedEvent
+import keyword_matcher
 from log_retention import cleanup_old_incident_reports
 from process_guard import verify_target_process
 from tools import AVAILABLE_TOOLS, TOOL_DISPATCH_MAP
@@ -573,36 +574,11 @@ class GeminiTriageAgent:
         Gemini API が利用できない環境・障害時に、一次スクリーニング理由とイベント内容から
         ローカルルールのみで `[CRITICAL]` または `[SUSPICIOUS]` を即時判定します。
         """
-        reasons_joined = " ".join(event.screening_reasons)
-        reasons_lower = reasons_joined.lower()
-        cmd_lower = (event.command_line or "").lower()
-
-        if "[critical候補]" in reasons_lower:
-            return config.SEVERITY_CRITICAL
-
-        high_risk_tokens = (
-            "mimikatz",
-            "sekurlsa",
-            "vssadmin",
-            "wevtutil",
-            "fltmc",
-            "sysmondrv",
-            "clear-winevent",
-            "clear-eventlog",
-            "auditpol",
-            "evtclearlog",
-            "sysmon のアンインストール",
-            "-enc",
-            "encodedcommand",
-            "frombase64string",
-            "downloadstring",
-            "iex",
-            "invoke-expression",
-            "mshta",
-            "certutil -urlcache",
-            "certutil.exe -urlcache",
-        )
-        if any(tok in reasons_lower or tok in cmd_lower for tok in high_risk_tokens):
+        if keyword_matcher.has_high_risk_keyword(
+            event.command_line,
+            reasons=event.screening_reasons,
+            image=event.image,
+        ):
             return config.SEVERITY_CRITICAL
 
         img_lower = (event.image or "").lower()

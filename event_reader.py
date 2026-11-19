@@ -22,6 +22,7 @@ import xml.etree.ElementTree as ET
 
 import allowlist
 import config
+import keyword_matcher
 
 logger = logging.getLogger("sysmon_gemini_agent.event_reader")
 
@@ -593,7 +594,7 @@ def _screen_registry_event(event: NormalizedEvent, reasons: list[str]) -> None:
     if any(path_pat in target_lower for path_pat in config.PERSISTENCE_REGISTRY_PATHS):
         is_suspicious_val = (
             any(tp.lower() in details_lower for tp in config.SUSPICIOUS_TEMP_PATHS)
-            or any(kw.lower() in details_lower for kw in config.SUSPICIOUS_KEYWORDS)
+            or bool(keyword_matcher.find_suspicious_keywords(details))
             or src_base in config.DROPPER_SOURCE_IMAGES
             or src_base == "reg.exe"
         )
@@ -803,11 +804,18 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
         elif _SYSMON_CLI_TAMPER_RE.search(event.parent_command_line or ""):
             reasons.append("親プロセスで Sysmon のアンインストール/設定変更 (-u / -c) を検出")
 
-        for keyword in config.SUSPICIOUS_KEYWORDS:
-            kw_lower = keyword.lower()
-            if kw_lower in cmd_lower:
-                reasons.append(f"コマンドラインに不審キーワード '{keyword}' を検出")
-            elif kw_lower in parent_cmd_lower:
+        cmd_matched = keyword_matcher.find_suspicious_keywords(
+            event.command_line, image=event.image
+        )
+        for keyword in cmd_matched:
+            reasons.append(f"コマンドラインに不審キーワード '{keyword}' を検出")
+
+        cmd_matched_set = set(cmd_matched)
+        parent_matched = keyword_matcher.find_suspicious_keywords(
+            event.parent_command_line, image=event.parent_image
+        )
+        for keyword in parent_matched:
+            if keyword not in cmd_matched_set:
                 reasons.append(f"親プロセスコマンドラインに不審キーワード '{keyword}' を検出")
 
     # 条件2: 一時ディレクトリからの実行ファイル・スクリプト起動検査 (プロセス生成イベントのみ対象)
