@@ -1,10 +1,10 @@
 # HANDOVER.md — `sysmon-gemini-agent` 引き継ぎドキュメント
 
-> **最終更新日**: 2026-11-19  
+> **最終更新日**: 2026-11-22  
 > **引き継ぎ元会話**: `Windows Event Log Gemini Monitor`（Conversation ID: `0cd84d29-4734-4dfb-a25f-e34228e217dd`、2026-11-11 〜 2026-11-14）  
 > **対象ワークスペース**: `c:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent`  
 > **リモートリポジトリ**: `https://github.com/exdodo/sysmon-gemini-agent.git`（`main` / `origin/main`）  
-> **現在のリポジトリ最新状態**: `v1.16`（入出力プレーンテキスト最適化。ローカルコミット・タグ作成済み／`v1.15` 以降のリモート `git push` 状況に留意）
+> **現在のリポジトリ最新状態**: `v1.18`（API キー管理を Windows 資格情報マネージャー優先＋固有環境変数 `SYSMON_GEMINI_API_KEY` へ分離）
 
 ---
 
@@ -38,7 +38,7 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 - **Python / `uv`**: `pip` 単体や Windows Store エイリアス `python.exe` は使用禁止。必ず `C:\Users\Yusuke\.local\bin\uv.exe`（Python 3.13）で `.venv` を管理し、実行は `.\.venv\Scripts\python.exe` または `.\.venv\Scripts\pythonw.exe` を使用する。
 - **PowerShell (`.ps1`)**: Windows PowerShell 5.1 の文字化け・構文エラー防止のため、日本語を含む `.ps1` は必ず **UTF-8 (BOM付き: `EF BB BF`)** で保存する。
 - **Gemini SDK・モデル自動追従**:
-  - 旧 `google-generativeai` は禁止。必ず `google-genai`（`from google import genai`）＋環境変数 `GEMINI_API_KEY` を使用（ハードコード禁止）。
+  - 旧 `google-generativeai` は禁止。必ず `google-genai`（`from google import genai`）＋ Windows 資格情報マネージャー（`keyring`: `sysmon-gemini-agent` / `gemini_api_key`）またはプロジェクト固有環境変数 `SYSMON_GEMINI_API_KEY` を使用（ハードコード・汎用 `GEMINI_API_KEY` の常用禁止）。
   - デフォルト `auto` による起動時＆6時間ごとの `client.models.list()` 照会、安定版優先 → 数値バージョン降順 → 軽量ティア優先の順位付け、404/廃止検知時の即時切替リトライ、実使用モデルのログ・レポート明記を維持する。
 - **バージョン管理規約 (`GEMINI.md`)**:
   - 機能追加・仕様変更・重要修正時は必ず `config.py` の `APP_VERSION` を更新し（小規模 `+0.01` / 大規模 `+0.10`）、① `config.py` 更新、② `CHANGELOG.md` 追記、③ Git コミット＆タグ付与（`vX.XX`）を 3 点セットで実施する（`git push` はユーザーの明示指示時のみ）。
@@ -59,6 +59,8 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 | `v1.14` (`3025b4d`)<br>*(別ターンで反映済)* | 2026-11-15 | ・`triage_cache.py` による `[CLEAN]` 24時間 SHA-256 キャッシュ（高リスク/改ざんイベントはキャッシュ除外）。<br>・`[CLEAN]` 時 AI 回答の短文化、`log_retention.py` ＆ `RotatingFileHandler`（5 MB × 5 世代 / 30 日 / 100 MB 上限）を実装。 |
 | `v1.15` (`7e32a7c`) | 2026-11-18 | ・事前リスク別サービスティア振り分け（`[SUSPICIOUS]` 候補はコスト半額の `service_tier="flex"` / 300秒タイムアウト、`[CRITICAL]` 候補は `standard` 即時優先）および混雑時 `standard` 自動フォールバックを実装。 |
 | `v1.16` | 2026-11-19 | ・Gemini 入出力のプレーンテキスト統一（Markdown 装飾 `#`, `**`, `*`, `---` や挨拶の抑止、`_build_initial_prompt` のコンパクト JSON＋プレーンテキスト化）、オフライン/空応答出力の統一、`summarize_clean_report()` の `・` 除去対応を実装。 |
+| `v1.17` | 2026-11-19 | ・`keyword_matcher.py` による一次スクリーニング精密化（`iex` / `bypass` / `hidden` / `-enc` / System32 `rundll32`/`regsvr32` 誤検知解消）。 |
+| `v1.18` | 2026-11-22 | ・`GEMINI_API_KEY` 依存を廃止し、Windows 資格情報マネージャー (`keyring`) 優先＋`SYSMON_GEMINI_API_KEY` フォールバック・`start_agent.ps1` の `-AsSecureString`＋stdin 登録へ移行。 |
 
 ---
 
@@ -66,7 +68,7 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 
 | ファイル | 役割 |
 | :--- | :--- |
-| `config.py` | `APP_VERSION = "1.16"`、監視対象チャネル/ID、一次スクリーニング条件、Gemini モデル設定、`MAX_DEPTH = 3`、キャッシュ/ログ保持設定、保護プロセス一覧 |
+| `config.py` | `APP_VERSION = "1.18"`、監視対象チャネル/ID、一次スクリーニング条件、Gemini モデル・資格情報設定、`MAX_DEPTH = 3`、キャッシュ/ログ保持設定、保護プロセス一覧 |
 | `event_reader.py` | `win32evtlog` Read-Only 収集、XML パース（`EventData`/`UserData`）、一次スクリーニング、`EventRecordID` 巻き戻り復旧、サービス死活監視、`checkpoint.json` 管理 |
 | `allowlist.py` | ホットリロード対応 `allowlist.json` 判定、高リスクイベントバイパス禁止ガード、GUI 登録候補抽出 |
 | `triage_cache.py` | `[CLEAN]` 判定パターンの正規化 SHA-256 フィンガープリント生成・24時間永続キャッシュ（`triage_cache.json`） |
@@ -76,7 +78,7 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 | `tray_app.py` | システムトレイ常駐（緑/黄/赤アイコン、右クリックメニュー、オフライン復旧後再トリアージ、120秒ダイアログ抑止） |
 | `log_retention.py` | `alerts/incident_YYYYMMDD.md` の保持期間（30日）・`alerts/` 合計容量（100 MB）に基づく安全クリーンアップ |
 | `main.py` | CLI エントリーポイント（`--interval`, `--once`, `--tray`, `--offline`, `--version`）、管理者権限チェック、ローテーションログ設定 |
-| `start_agent.ps1` | UTF-8 (BOM付き) PowerShell ランチャー（UAC 自動昇格、`uv`/`.venv` 確認、`GEMINI_API_KEY` 入力保存、トレイ起動） |
+| `start_agent.ps1` | UTF-8 (BOM付き) PowerShell ランチャー（UAC 自動昇格、`uv`/`.venv` 確認、`keyring` 安全入力保存、トレイ起動） |
 | `sysmon_config.xml` | 拡張イベント ID (`1, 3, 8, 10, 11, 12, 13, 14, 22`) を低ノイズで収集する Sysmon 設定テンプレート |
 | `CHANGELOG.md` / `README.md` | バージョン履歴（`1.00`〜`1.14`）およびセットアップ・運用ドキュメント |
 | *(Git 管理外)* | `allowlist.json`, `checkpoint.json`, `triage_cache.json`, `alerts/`, `.venv/` |

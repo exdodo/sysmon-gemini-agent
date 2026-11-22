@@ -2,6 +2,15 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.18] - 2026-11-22
+汎用環境変数 `GEMINI_API_KEY` による他プロセスからの参照・悪用リスクを防ぐため、Windows 資格情報マネージャー (`keyring`) 優先＋プロジェクト固有環境変数 (`SYSMON_GEMINI_API_KEY`) フォールバックへ移行。
+
+### 変更・セキュリティ強化
+- **API キー管理の分離 (`config.py`, `agent.py`, `requirements.txt`)**:
+  - `GEMINI_API_KEY` の暗黙参照を廃止し、`SYSMON_GEMINI_API_KEY`（テスト用の一時上書き）→ Windows 資格情報マネージャー (`sysmon-gemini-agent` / `gemini_api_key`) の順で取得し、`genai.Client(api_key=...)` へ明示渡しするよう変更。
+- **ランチャーの安全な登録フロー (`start_agent.ps1`)**:
+  - 未登録時のキー入力を `-AsSecureString` による非表示入力へ変更し、コマンドライン引数に残らないよう標準入力経由で Windows 資格情報マネージャーへ保存するよう刷新。
+
 ## [1.17] - 2026-11-19
 一次スクリーニングの不審キーワード判定を単純な部分一致から精密ルール（単語境界・PowerShell 引数パターン・正規 System32 `rundll32`/`regsvr32` 除外）へ刷新し、`msiexec.exe`（`iex` 部分一致）や Windows 標準 `rundll32.exe` による誤検知を解消。
 

@@ -31,6 +31,14 @@ except ImportError:
     APIError = Exception  # type: ignore[assignment,misc]
     HAS_GOOGLE_GENAI = False
 
+try:
+    import keyring
+
+    HAS_KEYRING = True
+except ImportError:
+    keyring = None  # type: ignore[assignment]
+    HAS_KEYRING = False
+
 import config
 from event_reader import NormalizedEvent
 import keyword_matcher
@@ -71,11 +79,29 @@ SYSTEM_INSTRUCTION = """あなたはWindowsセキュリティ監視（SOC）の�
 class GeminiTriageAgent:
     """
     Google Gemini (`google-genai` SDK) を用いた自律トリアージエージェント。
-    - 環境変数 `GEMINI_API_KEY` を使用（ハードコード禁止）
+    - Windows 資格情報マネージャー (`keyring`) または環境変数 `SYSMON_GEMINI_API_KEY` を使用（ハードコード禁止）
     - `max_depth = 3` による厳格な Function Calling ループ上限
     - Exponential Backoff による 429 / ResourceExhausted リトライ
     - `alerts/incident_YYYYMMDD.md` への追記専用出力
     """
+
+    @staticmethod
+    def _resolve_api_key() -> str:
+        """プロジェクト固有環境変数または Windows 資格情報マネージャーから API キーを取得します。"""
+        env_key = os.environ.get(config.GEMINI_API_KEY_ENV, "").strip()
+        if env_key:
+            return env_key
+        if HAS_KEYRING and keyring is not None:
+            try:
+                stored = keyring.get_password(
+                    config.KEYRING_SERVICE_NAME,
+                    config.KEYRING_USERNAME,
+                )
+                if stored and stored.strip():
+                    return stored.strip()
+            except Exception as exc:
+                logger.warning("Windows 資格情報マネージャーからの API キー取得に失敗しました: %s", exc)
+        return ""
 
     def __init__(
         self,
@@ -113,17 +139,20 @@ class GeminiTriageAgent:
                 "`pip install google-genai` を実行してください。"
             )
 
-        api_key = os.environ.get("GEMINI_API_KEY", "").strip()
+        api_key = self._resolve_api_key()
         if not api_key:
             raise EnvironmentError(
-                "環境変数 'GEMINI_API_KEY' が設定されていません。"
-                "実行前に `$env:GEMINI_API_KEY = 'あなたのAPIキー'` を設定してください。"
+                "Gemini API キーが設定されていません。"
+                f"`.\\start_agent.ps1` を実行して登録するか、"
+                f"`$env:{config.GEMINI_API_KEY_ENV}` または Windows 資格情報マネージャー "
+                f"({config.KEYRING_SERVICE_NAME}/{config.KEYRING_USERNAME}) に設定してください。"
             )
 
-        # 公式 google-genai SDK の Client 初期化 (環境変数 GEMINI_API_KEY を自動参照)
+        # 公式 google-genai SDK の Client 初期化 (明示的に api_key を渡す)
         # Flex ティア待機に対応するため長めの HTTP タイムアウト (既定 300,000 ms = 5分) を設定
         self.client = genai.Client(
-            http_options=types.HttpOptions(timeout=config.FLEX_HTTP_TIMEOUT_MS)
+            api_key=api_key,
+            http_options=types.HttpOptions(timeout=config.FLEX_HTTP_TIMEOUT_MS),
         )
         requested_model = (model_name or "").strip() or "auto"
         self.auto_model_enabled: bool = requested_model.lower() == "auto"

@@ -1,6 +1,6 @@
 # Windows Event Log & Sysmon 監視エージェント (Google Gemini版)
 
-> **Version**: `1.17`（変更履歴は [CHANGELOG.md](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/CHANGELOG.md) を参照）
+> **Version**: `1.18`（変更履歴は [CHANGELOG.md](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/CHANGELOG.md) を参照）
 
 Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, `System`）を定期巡回し、**ルールベースの一次スクリーニング**と **Google Gemini (`google-genai` SDK) の自律調査ループ（Function Calling）**、および **オフライン・API障害時のローカル即時フォールバック判定** を組み合わせて、不審なプロセス・インジェクション・永続化・外部通信の兆候を安全かつ低コストにトリアージする監視エージェントです。
 
@@ -82,7 +82,7 @@ uv pip install -r requirements.txt
 ## 3. 実行手順
 
 ### かんたん起動（`start_agent.ps1` を使用 — 推奨）
-[start_agent.ps1](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/start_agent.ps1) を実行すると、**①管理者権限への自動昇格（UAC）**、**②`.venv` と依存パッケージの自動確認**、**③`GEMINI_API_KEY` 未設定時の入力・保存**、**④タスクバー常駐（`--tray`）起動** をワンコマンドで行います。
+[start_agent.ps1](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/start_agent.ps1) を実行すると、**①管理者権限への自動昇格（UAC）**、**②`.venv` と依存パッケージの自動確認**、**③Windows 資格情報マネージャーへの API キー未登録時の安全入力・保存**、**④タスクバー常駐（`--tray`）起動** をワンコマンドで行います。
 
 ```powershell
 cd C:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent
@@ -105,11 +105,17 @@ powershell -ExecutionPolicy Bypass -File .\start_agent.ps1 -Mode Once
 `Security` チャネルおよび `Microsoft-Windows-Sysmon/Operational` チャネルの読み取りには **Windows 管理者権限** が必要です。
 スタートメニューから PowerShell を右クリックし、**「管理者として実行」** を選択してください。
 
-### 手順2: 環境変数 `GEMINI_API_KEY` の設定
-APIキーはコード内にハードコードせず、環境変数から読み込みます。
+### 手順2: Windows 資格情報マネージャーへの API キー登録（推奨）
+汎用環境変数 `GEMINI_API_KEY` による他ツールとの競合・露出を防ぐため、通常運用時は **Windows 資格情報マネージャー**（サービス名 `sysmon-gemini-agent` / ユーザー名 `gemini_api_key`）に保存します：
 
 ```powershell
-$env:GEMINI_API_KEY = "AIzaSy..."
+.\.venv\Scripts\python.exe -m keyring set sysmon-gemini-agent gemini_api_key
+```
+
+一時的なテスト用途で環境変数から上書きしたい場合のみ、プロジェクト固有の環境変数 `SYSMON_GEMINI_API_KEY` を使用できます：
+
+```powershell
+$env:SYSMON_GEMINI_API_KEY = "AIzaSy..."
 ```
 
 使用するモデルを明示的に固定したい場合（デフォルトは `auto` で最新モデルを自動選択）は、環境変数 `GEMINI_MODEL` で切り替え可能です：
