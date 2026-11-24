@@ -242,20 +242,96 @@ def extract_rule_candidate(event: NormalizedEvent) -> tuple[bool, str, str, str]
     )
 
 
-def add_rule_for_event(
-    event: NormalizedEvent,
-    allowlist_path: Path | None = None,
-) -> tuple[bool, str, str]:
+_SAFE_RULE_MIN_LEN: int = 4
+
+# 許可フォルダ登録時に過度に広範なルートパスを誤登録するのを防ぐ一覧（正規化小文字・末尾\なし）
+_OVERBROAD_PREFIXES: frozenset[str] = frozenset(
+    {
+        "c:",
+        "c:\\",
+        "c:\\windows",
+        "c:\\windows\\system32",
+        "c:\\windows\\syswow64",
+        "c:\\windows\\temp",
+        "c:\\program files",
+        "c:\\program files (x86)",
+        "c:\\programdata",
+        "c:\\users",
+        "c:\\users\\public",
+        "\\appdata\\roaming\\",
+        "\\appdata\\local\\temp\\",
+        "\\windows\\temp\\",
+        "\\users\\public\\",
+        "\\programdata\\",
+    }
+)
+
+
+def validate_rule_entry(section_key: str, value: str) -> tuple[bool, str]:
     """
-    イベントに対応する安全な許可ルールを `allowlist.json` へ追記保存します。
-    戻り値: (登録/既存確認成功フラグ, 登録した値, メッセージ)
+    ホワイトリストのセクションと登録値が安全ポリシーを満たしているか検証します。
+    汎用インタプリタ単体、広範すぎるディレクトリ、絶対警戒キーワードを拒否します。
+    """
+    if section_key not in DEFAULT_ALLOWLIST_DATA:
+        return (False, f"不正なホワイトリストセクションです: {section_key}")
+
+    cleaned = (value or "").strip()
+    if len(cleaned) < _SAFE_RULE_MIN_LEN:
+        return (False, "登録値が短すぎるため安全上許可できません。")
+
+    if keyword_matcher.has_never_allowlist_keyword(cleaned):
+        return (False, "改ざん・攻撃ツール等の絶対警戒キーワードを含むため登録できません。")
+
+    lower = cleaned.replace("/", "\\").lower()
+    norm_no_slash = lower.rstrip("\\")
+    base_name = norm_no_slash.rsplit("\\", 1)[-1]
+
+    if section_key == "trusted_images":
+        if base_name in GENERIC_INTERPRETER_BASENAMES:
+            return (
+                False,
+                f"汎用インタプリタ/LOLBin ({base_name}) 単体は安全維持のため登録できません。",
+            )
+    elif section_key == "trusted_image_prefixes":
+        if lower in _OVERBROAD_PREFIXES or norm_no_slash in _OVERBROAD_PREFIXES:
+            return (
+                False,
+                f"対象範囲が広すぎるディレクトリ ({cleaned}) は登録できません。",
+            )
+        if re.fullmatch(r"[a-z]:", norm_no_slash) or re.fullmatch(
+            r"[a-z]:\\users\\[^\\]+(?:\\appdata(?:\\(?:local|roaming)(?:\\temp)?)?)?",
+            norm_no_slash,
+        ):
+            return (
+                False,
+                f"ユーザー/AppData ルート直下のような広範パス ({cleaned}) は登録できません。",
+            )
+    elif section_key == "trusted_command_line_contains":
+        if base_name in GENERIC_INTERPRETER_BASENAMES and "\\" not in lower:
+            return (
+                False,
+                f"汎用コマンド名 ({base_name}) 単体は登録できません。",
+            )
+
+    return (True, "")
+
+
+def add_rule_entry(
+    section_key: str,
+    value: str,
+    allowlist_path: Path | None = None,
+) -> tuple[bool, str]:
+    """
+    セクションと値を直接指定し、安全検証のうえで `allowlist.json` へ追記保存します。
+    戻り値: (成功フラグ, メッセージ)
     """
     global _CACHE_SIGNATURE, _CACHE_DATA
-    target_path = allowlist_path or config.ALLOWLIST_FILE
-    ok, section_key, value, desc = extract_rule_candidate(event)
+    cleaned = (value or "").strip()
+    ok, err_msg = validate_rule_entry(section_key, cleaned)
     if not ok:
-        return (False, "", desc)
+        return (False, err_msg)
 
+    target_path = allowlist_path or config.ALLOWLIST_FILE
     with _LOCK:
         ensure_allowlist_file(target_path)
         try:
@@ -271,15 +347,31 @@ def add_rule_for_event(
             for k in DEFAULT_ALLOWLIST_DATA
         }
         existing_lower = {v.lower() for v in normalized[section_key]}
-        if value.lower() in existing_lower:
-            return (True, value, f"既に許可リストに登録済みです: {value}")
+        if cleaned.lower() in existing_lower:
+            return (True, f"既に許可リストに登録済みです: {cleaned}")
 
-        normalized[section_key].append(value)
+        normalized[section_key].append(cleaned)
         serialized = json.dumps(normalized, indent=2, ensure_ascii=False)
         with open(target_path, mode="w", encoding="utf-8") as fp:
             fp.write(serialized + "\n")
 
         _CACHE_SIGNATURE = None
         _CACHE_DATA = normalized
-        logger.info("許可リスト (%s) にルールを追加しました [%s]: %s", target_path.name, section_key, value)
-        return (True, value, f"許可リストに追加しました（次回巡回から自動適用）:\n[{section_key}] {value}")
+        logger.info("許可リスト (%s) にルールを追加しました [%s]: %s", target_path.name, section_key, cleaned)
+        return (True, f"許可リストに追加しました（次回巡回から自動適用）:\n[{section_key}] {cleaned}")
+
+
+def add_rule_for_event(
+    event: NormalizedEvent,
+    allowlist_path: Path | None = None,
+) -> tuple[bool, str, str]:
+    """
+    イベントに対応する安全な許可ルールを `allowlist.json` へ追記保存します。
+    戻り値: (登録/既存確認成功フラグ, 登録した値, メッセージ)
+    """
+    ok, section_key, value, desc = extract_rule_candidate(event)
+    if not ok:
+        return (False, "", desc)
+
+    saved, msg = add_rule_entry(section_key, value, allowlist_path=allowlist_path)
+    return (saved, value if saved else "", msg)

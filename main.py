@@ -8,6 +8,7 @@ Windows Event Log & Sysmon 監視エージェント メインエントリーポ�
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import argparse
 import ctypes
 import logging
@@ -17,6 +18,7 @@ import time
 
 from agent import GeminiTriageAgent
 import config
+from daily_reviewer import DailyReviewer, show_allowlist_review_dialog
 from event_reader import CheckpointManager, NormalizedEvent, WindowsEventReader
 from process_guard import show_critical_response_dialog
 
@@ -107,6 +109,7 @@ def run_monitoring_loop(
 
     checkpoint_mgr = CheckpointManager(config.CHECKPOINT_FILE)
     event_reader = WindowsEventReader(checkpoint_mgr)
+    daily_reviewer = DailyReviewer(alerts_dir=config.ALERTS_DIR)
     pending_offline_events: list[NormalizedEvent] = []
 
     try:
@@ -195,6 +198,9 @@ def run_monitoring_loop(
 
             checkpoint_mgr.save()
 
+            if not offline_only:
+                daily_reviewer.run_if_due(triage_agent)
+
             if run_once:
                 logger.info("--once オプションが指定されたため、1サイクル完了後に終了します。")
                 break
@@ -237,6 +243,16 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Gemini API を呼び出さず、ルールベースの一次検知・オフライン判定のみで監視します。",
     )
     parser.add_argument(
+        "--daily-review",
+        action="store_true",
+        help="前日のインシデントログに対する Gemini 日次総合レビューと候補抽出を1回実行して終了します。",
+    )
+    parser.add_argument(
+        "--review-candidates",
+        action="store_true",
+        help="保留中のホワイトリスト候補を1件ずつ確認して登録するGUIを開きます。",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s v{config.APP_VERSION}",
@@ -246,6 +262,25 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
 
 if __name__ == "__main__":
     args = parse_args()
+    if args.review_candidates:
+        show_allowlist_review_dialog()
+        sys.exit(0)
+    if args.daily_review:
+        logger = setup_logging()
+        triage = GeminiTriageAgent(
+            model_name=config.GEMINI_MODEL,
+            max_depth=config.MAX_DEPTH,
+            alerts_dir=config.ALERTS_DIR,
+            offline_only=args.offline,
+        )
+        yesterday = (datetime.now().astimezone() - timedelta(days=1)).date()
+        res = DailyReviewer(alerts_dir=config.ALERTS_DIR).run_review_for_date(
+            target_date=yesterday,
+            triage_agent=triage,
+            force=True,
+        )
+        print(res)
+        sys.exit(0 if res.get("status") in ("ok", "empty", "no_log", "already_reviewed") else 1)
     if args.tray:
         setup_logging()
         from tray_app import SysmonTrayApp

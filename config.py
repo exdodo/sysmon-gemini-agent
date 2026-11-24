@@ -13,7 +13,7 @@ from pathlib import Path
 # ============================================================================
 # アプリケーションバージョン定義 (機能追加時に更新し、CHANGELOG.md / Gitタグと同期)
 # ============================================================================
-APP_VERSION: str = "1.18"
+APP_VERSION: str = "1.19"
 
 # ============================================================================
 # パス設定 (ワークスペース内に閉じた設計・親ディレクトリへのアクセス禁止)
@@ -23,7 +23,12 @@ CHECKPOINT_FILE: Path = BASE_DIR / "checkpoint.json"
 ALERTS_DIR: Path = BASE_DIR / "alerts"
 AGENT_LOG_FILE: Path = ALERTS_DIR / "agent_runtime.log"
 ALLOWLIST_FILE: Path = BASE_DIR / "allowlist.json"
+ALLOWLIST_CANDIDATES_FILE: Path = BASE_DIR / "allowlist_candidates.json"
+DAILY_REVIEW_STATE_FILE: Path = BASE_DIR / "daily_review_state.json"
 TRIAGE_CACHE_FILE: Path = BASE_DIR / "triage_cache.json"
+
+# 日次ログレビュー（前日分の総合判断＆ホワイトリスト候補抽出）の実行時刻 (時)
+DAILY_REVIEW_HOUR: int = 9
 
 # ============================================================================
 # [CLEAN] 判定キャッシュ & ログ保持・ローテーション設定

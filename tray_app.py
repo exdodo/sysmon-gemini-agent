@@ -12,6 +12,7 @@ pystray と Pillow (PIL) を使用してタスクバー（システムトレイ�
 
 from __future__ import annotations
 
+from datetime import datetime, timedelta
 import ctypes
 import logging
 import os
@@ -22,6 +23,11 @@ from typing import Any
 from agent import GeminiTriageAgent
 import allowlist
 import config
+from daily_reviewer import (
+    AllowlistCandidateStore,
+    DailyReviewer,
+    open_allowlist_review_dialog_async,
+)
 from event_reader import CheckpointManager, NormalizedEvent, WindowsEventReader
 from process_guard import show_critical_response_dialog, verify_target_process
 
@@ -126,11 +132,17 @@ class SysmonTrayApp:
         self._critical_dialog_last_shown: dict[int, float] = {}
         self._stop_event = threading.Event()
         self._scan_now_event = threading.Event()
+        self._daily_review_now_event = threading.Event()
         self._lock = threading.Lock()
 
         self.checkpoint_mgr = CheckpointManager(config.CHECKPOINT_FILE)
         self.event_reader = WindowsEventReader(self.checkpoint_mgr)
         self.triage_agent: GeminiTriageAgent | None = None
+        self.candidate_store = AllowlistCandidateStore()
+        self.daily_reviewer = DailyReviewer(
+            alerts_dir=config.ALERTS_DIR,
+            candidate_store=self.candidate_store,
+        )
 
         self.icon = pystray.Icon(
             name="sysmon_gemini_agent",
@@ -155,6 +167,11 @@ class SysmonTrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("今すぐ巡回を実行", self._on_scan_now),
             pystray.MenuItem("直近のCRITICAL迎撃パネル (Suspend/Kill) を開く", self._on_open_critical_dialog),
+            pystray.MenuItem(
+                lambda item: f"ホワイトリスト候補を確認・登録 ({self.candidate_store.pending_count()}件)",
+                self._on_review_allowlist_candidates,
+            ),
+            pystray.MenuItem("前日ログの日次レビューを今すぐ実行", self._on_run_daily_review_now),
             pystray.MenuItem("許可リスト (allowlist.json) を開く", self._on_open_allowlist),
             pystray.MenuItem("アラート出力フォルダ (alerts) を開く", self._on_open_alerts_dir),
             pystray.MenuItem("実行ログ (agent_runtime.log) を開く", self._on_open_runtime_log),
@@ -203,6 +220,33 @@ class SysmonTrayApp:
         ev, rep_text, rep_file = self.last_critical_incident
         show_critical_response_dialog(ev, rep_text, rep_file)
 
+    def _refresh_tray_menu(self) -> None:
+        try:
+            self.icon.update_menu()
+        except Exception:
+            pass
+
+    def _on_review_allowlist_candidates(self, icon: Any, item: Any) -> None:
+        """保留中のホワイトリスト候補を 1 件ずつ確認して登録するダイアログを開きます。"""
+        opened = open_allowlist_review_dialog_async(
+            candidate_store=self.candidate_store,
+            on_updated=self._refresh_tray_menu,
+        )
+        if not opened:
+            try:
+                self.icon.notify(
+                    "ホワイトリスト候補の確認ウィンドウは既に開いています。",
+                    "Sysmon Gemini 監視エージェント",
+                )
+            except Exception:
+                pass
+
+    def _on_run_daily_review_now(self, icon: Any, item: Any) -> None:
+        """前日ログの Gemini 日次レビューを手動トリガーします。"""
+        logger.info("ユーザー操作により前日ログの日次レビューがリクエストされました。")
+        self._daily_review_now_event.set()
+        self._scan_now_event.set()
+
     def _on_open_alerts_dir(self, icon: Any, item: Any) -> None:
         """エクスプローラーで alerts フォルダを開きます（Read-Only表示）。"""
         config.ALERTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -241,6 +285,7 @@ class SysmonTrayApp:
         """バックグラウンド監視スレッドを停止し、チェックポイントを保存して終了します。"""
         logger.info("タスクバーメニューから終了が選択されました。安全に停止処理を行います...")
         self._stop_event.set()
+        self._daily_review_now_event.set()
         self._scan_now_event.set()
         self.checkpoint_mgr.save()
         self.icon.stop()
@@ -398,6 +443,59 @@ class SysmonTrayApp:
                 notify_title="Sysmon Gemini 監視エージェント [正常復帰]",
             )
 
+    def _maybe_run_daily_review(self) -> None:
+        manual = self._daily_review_now_event.is_set()
+        if manual:
+            self._daily_review_now_event.clear()
+
+        if self.triage_agent is None or self.offline_only:
+            if manual:
+                try:
+                    self.icon.notify(
+                        "オフラインモード中は日次AIレビューを実行できません。",
+                        "Sysmon Gemini 日次レビュー",
+                    )
+                except Exception:
+                    pass
+            return
+
+        if manual:
+            yesterday = (datetime.now().astimezone() - timedelta(days=1)).date()
+            review_res = self.daily_reviewer.run_review_for_date(
+                target_date=yesterday,
+                triage_agent=self.triage_agent,
+                force=True,
+            )
+        else:
+            review_res = self.daily_reviewer.run_if_due(self.triage_agent)
+
+        if not review_res:
+            return
+
+        self._refresh_tray_menu()
+        status = review_res.get("status")
+        if status == "ok":
+            added = review_res.get("candidate_stats", {}).get("added", 0)
+            pending = review_res.get("pending_candidates", 0)
+            assessment = review_res.get("overall_assessment", "SAFE")
+            if added > 0 or assessment in ("ATTENTION", "INCIDENT_SUSPECTED") or manual:
+                try:
+                    self.icon.notify(
+                        f"対象日 {review_res['target_date']}: 総合={assessment} / "
+                        f"新規候補 {added}件 (待機計 {pending}件)",
+                        "Sysmon Gemini 日次レビュー完了",
+                    )
+                except Exception:
+                    pass
+        elif manual:
+            try:
+                self.icon.notify(
+                    str(review_res.get("message") or "日次レビューを実行できませんでした。"),
+                    "Sysmon Gemini 日次レビュー",
+                )
+            except Exception:
+                pass
+
     def _monitoring_worker(self) -> None:
         """バックグラウンドで定期巡回とトリアージを行うワーカースレッド。"""
         if not self._is_admin():
@@ -454,6 +552,9 @@ class SysmonTrayApp:
                 # オフラインフォールバック保留分があればオンライン復旧後に再判定し、条件を満たせば緑色へ自動復帰
                 self._reconcile_pending_offline_alerts()
 
+                # 1日1回の前日ログ総合レビュー＆ホワイトリスト候補抽出 (Flexモード)
+                self._maybe_run_daily_review()
+
                 self.checkpoint_mgr.save()
 
             except Exception as loop_exc:
@@ -482,6 +583,7 @@ class SysmonTrayApp:
         worker.start()
         self.icon.run()
         self._stop_event.set()
+        self._daily_review_now_event.set()
         self._scan_now_event.set()
         worker.join(timeout=5.0)
         return 0

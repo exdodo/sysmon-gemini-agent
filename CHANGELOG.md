@@ -2,6 +2,18 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.19] - 2026-11-24
+前日アラートログの日次総合レビュー（Gemini Flex ティア）および保留ホワイトリスト候補の 1 件ずつ確認・登録機能を実装。
+
+### 追加・改善
+- **日次ログ総合レビュー＆ホワイトリスト候補キュー (`daily_reviewer.py`, `agent.py`, `config.py`)**:
+  - 毎日1回（`DAILY_REVIEW_HOUR = 9` 時以降の初回巡回時、またはトレイ/CLI `--daily-review` による手動実行時）、前日分の `alerts/incident_YYYYMMDD.md` を Python でパターン集約した上で Gemini（`service_tier="flex"`）へ送信。
+  - 単発イベント間の時系列相関・多段階攻撃の有無を評価し、`alerts/daily_review_YYYYMMDD.md` へ出力。
+  - `[CLEAN]` の頻出パターンから安全なホワイトリスト候補を抽出し、`allowlist_candidates.json` に保留キューとして蓄積（自動直接登録はせず、すべて `allowlist.validate_rule_entry()` で汎用インタプリタや広範ディレクトリをブロック）。
+- **1件ずつ確認しながら登録できるステップ確認 UI (`daily_reviewer.py`, `tray_app.py`, `main.py`, `allowlist.py`)**:
+  - タスクトレイメニュー「**ホワイトリスト候補を確認・登録 (N件)**」（および `main.py --review-candidates`）から、蓄積された候補を 1 件ずつ（対象プロセス・代表コマンドライン・Gemini 推奨理由・リスク評価を確認し、必要なら登録値を編集した上で）「**登録して次へ**」「**却下して次へ**」「**保留して次へ**」で順次処理できるダイアログを追加。
+  - `log_retention.py` で `daily_review_YYYYMMDD.md` も 30 日保持対象に統合。
+
 ## [1.18] - 2026-11-22
 汎用環境変数 `GEMINI_API_KEY` による他プロセスからの参照・悪用リスクを防ぐため、Windows 資格情報マネージャー (`keyring`) 優先＋プロジェクト固有環境変数 (`SYSMON_GEMINI_API_KEY`) フォールバックへ移行。
 

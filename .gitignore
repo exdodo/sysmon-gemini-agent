@@ -183,5 +183,7 @@ cython_debug/
 alerts/
 checkpoint.json
 allowlist.json
+allowlist_candidates.json
+daily_review_state.json
 triage_cache.json
 *.tmp

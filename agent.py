@@ -701,16 +701,15 @@ class GeminiTriageAgent:
             return config.GEMINI_CRITICAL_SERVICE_TIER, pre_severity
         return config.GEMINI_SERVICE_TIER, pre_severity
 
-    def _execute_gemini_triage_with_model_fallback(
+    def _call_with_tier_and_model_fallback(
         self,
-        event: NormalizedEvent,
-    ) -> tuple[str, int, list[dict[str, Any]]]:
-        """自動モデル更新・404時後継切替・Flexリトライ上限時standard切替を含めて Gemini 自律調査ループを実行します。"""
+        initial_tier: str,
+        executor: Any,
+    ) -> tuple[Any, str]:
+        """指定ティア優先でモデル404切替・Flexリトライ上限時standardフォールバック付きで実行します。"""
         if self.auto_model_enabled:
             self.refresh_latest_model(force=False)
 
-        prompt = self._build_initial_prompt(event)
-        initial_tier, pre_severity = self._select_initial_service_tier(event)
         tiers_to_try = [initial_tier]
         if (
             config.FLEX_FALLBACK_TO_STANDARD
@@ -719,22 +718,8 @@ class GeminiTriageAgent:
         ):
             tiers_to_try.append(config.GEMINI_FALLBACK_SERVICE_TIER)
 
-        logger.info(
-            "Gemini 自律調査を開始します: Model=%s, PreSeverity=%s, Tier=%s, Channel=%s, EventID=%d, RecordID=%d (max_depth=%d)",
-            self.model_name,
-            pre_severity,
-            tiers_to_try[0],
-            event.channel,
-            event.event_id,
-            event.event_record_id,
-            self.max_depth,
-        )
-
         tried_models: set[str] = set()
         max_fallback_attempts = max(len(config.FALLBACK_GEMINI_MODELS), 3)
-        report_text = ""
-        depth = 0
-        tool_trace: list[dict[str, Any]] = []
 
         for tier_idx, service_tier in enumerate(tiers_to_try):
             has_next_tier = tier_idx + 1 < len(tiers_to_try)
@@ -742,12 +727,10 @@ class GeminiTriageAgent:
                 for attempt_idx in range(max_fallback_attempts + 1):
                     tried_models.add(self.model_name)
                     try:
-                        report_text, depth, tool_trace = self._run_chat_triage_loop(
-                            prompt, service_tier=service_tier
-                        )
+                        res = executor(service_tier)
                         self.last_used_service_tier = service_tier
                         self._api_offline_until = 0.0
-                        break
+                        return res, service_tier
                     except APIError as api_err:
                         if (
                             attempt_idx < max_fallback_attempts
@@ -756,7 +739,6 @@ class GeminiTriageAgent:
                         ):
                             continue
                         raise
-                break
             except Exception as tier_exc:
                 is_congestion_or_net = isinstance(
                     tier_exc, (ConnectionError, TimeoutError, OSError)
@@ -775,6 +757,70 @@ class GeminiTriageAgent:
                     tier_exc,
                 )
                 raise
+
+        raise RuntimeError("すべてのサービスティアで Gemini API 呼び出しに失敗しました。")
+
+    def generate_text_with_fallback(
+        self,
+        prompt: str,
+        system_instruction: str,
+        service_tier: str = config.GEMINI_SERVICE_TIER,
+        response_mime_type: str | None = None,
+        temperature: float = 0.1,
+    ) -> tuple[str, str]:
+        """
+        ツール呼び出しを伴わない単発テキスト/JSON生成を、Flex優先・指数バックオフ・
+        モデル自動切替・standardフォールバック付きで実行し、(本文, 実使用ティア) を返します。
+        """
+        if self.offline_only or self.client is None:
+            raise RuntimeError("オフラインモードでは Gemini API テキスト生成を実行できません。")
+
+        def _exec(tier: str) -> str:
+            cfg_kwargs: dict[str, Any] = {
+                "system_instruction": system_instruction,
+                "temperature": temperature,
+                "service_tier": tier,
+                "http_options": types.HttpOptions(timeout=self._resolve_http_timeout_ms(tier)),
+            }
+            if response_mime_type:
+                cfg_kwargs["response_mime_type"] = response_mime_type
+            cfg = types.GenerateContentConfig(**cfg_kwargs)
+            resp = self._call_with_exponential_backoff(
+                self.client.models.generate_content,
+                model=self.model_name,
+                contents=prompt,
+                config=cfg,
+            )
+            return (resp.text or "").strip()
+
+        return self._call_with_tier_and_model_fallback(service_tier, _exec)
+
+    def _execute_gemini_triage_with_model_fallback(
+        self,
+        event: NormalizedEvent,
+    ) -> tuple[str, int, list[dict[str, Any]]]:
+        """自動モデル更新・404時後継切替・Flexリトライ上限時standard切替を含めて Gemini 自律調査ループを実行します。"""
+        if self.auto_model_enabled:
+            self.refresh_latest_model(force=False)
+
+        prompt = self._build_initial_prompt(event)
+        initial_tier, pre_severity = self._select_initial_service_tier(event)
+
+        logger.info(
+            "Gemini 自律調査を開始します: Model=%s, PreSeverity=%s, Tier=%s, Channel=%s, EventID=%d, RecordID=%d (max_depth=%d)",
+            self.model_name,
+            pre_severity,
+            initial_tier,
+            event.channel,
+            event.event_id,
+            event.event_record_id,
+            self.max_depth,
+        )
+
+        (report_text, depth, tool_trace), _ = self._call_with_tier_and_model_fallback(
+            initial_tier,
+            lambda tier: self._run_chat_triage_loop(prompt, service_tier=tier),
+        )
 
         if not report_text:
             report_text = (

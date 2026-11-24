@@ -22,7 +22,7 @@ import config
 
 logger = logging.getLogger("sysmon_gemini_agent.log_retention")
 
-_INCIDENT_FILE_RE = re.compile(r"^incident_(\d{8})\.md$")
+_INCIDENT_FILE_RE = re.compile(r"^(?:incident|daily_review)_(\d{8})\.md$")
 
 
 def _parse_incident_date(filename: str) -> date | None:
