@@ -128,6 +128,27 @@ class TestSecurityAndBugFixes(unittest.TestCase):
         )
         self.assertFalse(any("[CRITICAL候補]" in r for r in reasons))
 
+    def test_sysmon_id_255_getconfig_write_protected_not_critical(self) -> None:
+        for cmd in (
+            "Sysmon Error (ID=GetConfigurationOptions): Failed to open service configuration with error -1931804096 - Last error: このメディアは書き込み禁止になっています。",
+            "Sysmon Error (ID=GetConfigurationOptions): Failed to open service configuration with error 19 - The media is write protected.",
+        ):
+            with self.subTest(cmd=cmd):
+                ev = NormalizedEvent(
+                    channel=config.SYSMON_CHANNEL,
+                    event_id=255,
+                    event_record_id=21,
+                    image="Sysmon Driver/Service",
+                    command_line=cmd,
+                )
+                flagged, reasons = screen_event(ev)
+                self.assertTrue(flagged)
+                self.assertEqual(
+                    agent_mod.GeminiTriageAgent.classify_offline_severity(ev),
+                    config.SEVERITY_SUSPICIOUS,
+                )
+                self.assertFalse(any("[CRITICAL候補]" in r for r in reasons))
+
 
 if __name__ == "__main__":
     unittest.main(verbosity=2)

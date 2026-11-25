@@ -799,9 +799,11 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
                 "error 5" in cmd_lower
                 or "access is denied" in cmd_lower
                 or "アクセスが拒否" in cmd_lower
+                or "write protected" in cmd_lower
+                or "書き込み禁止" in cmd_lower
             ):
                 reasons.append(
-                    f"Sysmon 設定照会アクセス拒否 (Event ID 255 / 非管理者照会等: {event.command_line})"
+                    f"Sysmon 設定照会一時エラー (Event ID 255 / 権限・復帰時等: {event.command_line})"
                 )
             else:
                 reasons.append(

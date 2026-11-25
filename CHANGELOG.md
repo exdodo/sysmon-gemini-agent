@@ -2,6 +2,12 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.32] - 2026-11-25
+Sysmon Event ID 255（`GetConfigurationOptions`）における起動・復帰時の一時的な書き込み禁止エラー（日英メッセージ対応）の過剰 `[CRITICAL候補]` 判定を緩和。
+
+### 修正
+- **`event_reader.py`**: `GetConfigurationOptions` かつ `書き込み禁止` / `write protected` を含む Event ID `255` を `[CRITICAL候補]` から通常イベント（Flex / `[CLEAN]` キャッシュ対象外のまま通常トリアージ）へ格下げ（実際のサービス停止・設定改ざんは Event ID `4` / `16` および Heartbeat で引き続き `[CRITICAL]` 検知）。
+
 ## [1.31] - 2026-11-25
 OS レベルの予防的ハードニング（LSA 保護・メモリ整合性 HVCI・Microsoft Defender ASR 推奨12ルール）の確認＆段階的有効化ツールを追加。
 
