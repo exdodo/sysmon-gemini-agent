@@ -30,6 +30,7 @@ from daily_reviewer import (
     open_allowlist_review_dialog_async,
 )
 from event_reader import CheckpointManager, NormalizedEvent, WindowsEventReader
+from posture_check import open_posture_check_dialog_async
 from process_guard import show_critical_response_dialog, verify_target_process
 from triage_cache import compute_event_fingerprint
 from ui_host import shutdown_ui_host
@@ -294,6 +295,7 @@ class SysmonTrayApp:
                 self._on_review_allowlist_candidates,
             ),
             pystray.MenuItem("前日ログの日次レビューを今すぐ実行", self._on_run_daily_review_now),
+            pystray.MenuItem("OS防御設定を確認 (LSA / メモリ整合性 / ASR)", self._on_open_posture_check),
             pystray.MenuItem("許可リスト (allowlist.json) を開く", self._on_open_allowlist),
             pystray.MenuItem("アラート出力フォルダ (alerts) を開く", self._on_open_alerts_dir),
             pystray.MenuItem("実行ログ (agent_runtime.log) を開く", self._on_open_runtime_log),
@@ -408,6 +410,18 @@ class SysmonTrayApp:
         self._daily_review_now_event.set()
         self.flex_queue.wake()
         self._scan_now_event.set()
+
+    def _on_open_posture_check(self, icon: Any, item: Any) -> None:
+        """LSA 保護・メモリ整合性・ASR 状態を確認する診断ウィンドウを開きます。"""
+        opened = open_posture_check_dialog_async()
+        if not opened:
+            try:
+                self.icon.notify(
+                    "OS 防御設定診断ウィンドウは既に開いています。",
+                    "Sysmon Gemini 監視エージェント",
+                )
+            except Exception:
+                pass
 
     def _on_open_alerts_dir(self, icon: Any, item: Any) -> None:
         """エクスプローラーで alerts フォルダを開きます（Read-Only表示）。"""

@@ -271,6 +271,11 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="保留中のホワイトリスト候補を1件ずつ確認して登録するGUIを開きます。",
     )
     parser.add_argument(
+        "--posture-check",
+        action="store_true",
+        help="OS の LSA 保護・メモリ整合性・ASR ルール状態を Read-Only で診断表示して終了します。",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version=f"%(prog)s v{config.APP_VERSION}",
@@ -287,6 +292,11 @@ def _resolve_service_tier_override(args: argparse.Namespace) -> str | None:
 if __name__ == "__main__":
     args = parse_args()
     tier_override = _resolve_service_tier_override(args)
+    if args.posture_check:
+        from posture_check import collect_endpoint_posture, format_posture_report
+
+        print(format_posture_report(collect_endpoint_posture()))
+        sys.exit(0)
     if args.review_candidates:
         show_allowlist_review_dialog()
         sys.exit(0)

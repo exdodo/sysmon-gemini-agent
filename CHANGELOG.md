@@ -2,6 +2,17 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.31] - 2026-11-25
+OS レベルの予防的ハードニング（LSA 保護・メモリ整合性 HVCI・Microsoft Defender ASR 推奨12ルール）の確認＆段階的有効化ツールを追加。
+
+### 追加・改善
+- **OS 防御姿勢チェック機能 (`posture_check.py`, `main.py`, `tray_app.py`)**:
+  - `winreg` により LSA 保護 (`RunAsPPL`/`RunAsPPLBoot`)・メモリ整合性 (`HVCI Enabled`)・Defender 改ざん防止・ASR 推奨 12 ルールの状態を完全 Read-Only で収集・整形。
+  - CLI `main.py --posture-check` およびトレイメニュー「**OS防御設定を確認 (LSA / メモリ整合性 / ASR)**」からの診断ウィンドウ表示に対応。
+- **ASR / LSA / HVCI 確認＆安全有効化ランチャー (`harden_endpoint.ps1`)**:
+  - Windows PowerShell 5.1 (`powershell.exe`) 専用の UTF-8 (BOM付き) スクリプトとして実装（`-Mode Audit` / `ApplyAudit` / `CheckAsrLogs` / `ApplyBlock` / `Rollback`）。
+  - 既存の `Block`/`Warn` ルールを維持したまま推奨 12 ルールを監査モード (`AuditMode`) で導入し、`Event ID 1122/1121` の競合有無を確認してからブロックモードへ昇格可能。
+
 ## [1.30] - 2026-11-25
 セキュリティ・検知精度・耐障害性の包括的強化、15秒巡回と非同期 Flex トリアージの分離、503/504 多発時の自動クールダウン、および Flex ⇔ 通常 (`standard`) 処理のトレイ／CLI 切替を実装。
 

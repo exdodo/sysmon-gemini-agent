@@ -1,6 +1,6 @@
 # Windows Event Log & Sysmon 監視エージェント (Google Gemini版)
 
-> **Version**: `1.30`（変更履歴は [CHANGELOG.md](file:///./CHANGELOG.md) を参照）
+> **Version**: `1.31`（変更履歴は [CHANGELOG.md](file:///./CHANGELOG.md) を参照）
 
 Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, `System`）を定期巡回し、**ルールベースの一次スクリーニング**と **Google Gemini (`google-genai` SDK) の自律調査ループ（Function Calling）**、および **オフライン・API障害時のローカル即時フォールバック判定** を組み合わせて、不審なプロセス・インジェクション・永続化・外部通信の兆候を安全かつ低コストにトリアージする監視エージェントです。
 
@@ -171,6 +171,22 @@ cd C:\path\to\sysmon-gemini-agent
   - 「実行ログ (`agent_runtime.log`) を開く」
   - 「アイコンを正常色（緑）にリセット」
   - 「安全に終了 (`Exit`)」（チェックポイントを保存して停止）
+
+### OS 標準防御設定（LSA 保護・メモリ整合性・ASR ルール）の確認と段階的有効化
+```powershell
+# 現在の LSA 保護 / メモリ整合性 (HVCI) / ASR 12ルールの状態を確認 (Read-Only)
+.\.venv\Scripts\python.exe main.py --posture-check
+powershell -ExecutionPolicy Bypass -File .\harden_endpoint.ps1 -Mode Audit
+
+# ASR 推奨12ルールを「監査モード (AuditMode)」で安全に有効化（UAC昇格して実行）
+powershell -ExecutionPolicy Bypass -File .\harden_endpoint.ps1 -Mode ApplyAudit
+
+# 過去7日間の ASR 監査/ブロックログ (Event ID 1122/1121) で開発ツール等との競合を確認
+powershell -ExecutionPolicy Bypass -File .\harden_endpoint.ps1 -Mode CheckAsrLogs -Days 7
+
+# 問題なければブロックモードへ昇格（戻す場合は -Mode Rollback）
+powershell -ExecutionPolicy Bypass -File .\harden_endpoint.ps1 -Mode ApplyBlock
+```
 
 ---
 

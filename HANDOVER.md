@@ -3,7 +3,7 @@
 > **最終更新日**: 2026-11-25  
 > **対象ワークスペース**: `<repo-root>\sysmon-gemini-agent`  
 > **リモートリポジトリ**: `https://github.com/exdodo/sysmon-gemini-agent.git`（`main` / `origin/main`）  
-> **現在のリポジトリ最新状態**: `v1.30`（全9項目のセキュリティ/検知/構造改善 ＋ Flexキュー分離 ＋ 503/504自動クールダウン＆通常処理切替）
+> **現在のリポジトリ最新状態**: `v1.31`（OS 防御姿勢チェック＆LSA/HVCI/ASR 監査モード有効化対応）
 
 ---
 
@@ -62,7 +62,8 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 | `v1.18` (`18fc52e`) | 2026-11-22 | ・`GEMINI_API_KEY` 依存を廃止し、Windows 資格情報マネージャー (`keyring`) 優先＋`SYSMON_GEMINI_API_KEY` フォールバック・`start_agent.ps1` の `-AsSecureString`＋stdin 登録へ移行。 |
 | `v1.19` (`0a83a76`) | 2026-11-24 | ・`daily_reviewer.py` による前日ログの Gemini Flex 日次レビュー、`allowlist_candidates.json` 保留キュー蓄積、および 1 件ずつ確認登録できるステップ UI を追加。 |
 | `v1.20` (`0631eff`) | 2026-11-25 | ・`allowlist.py` の `trusted_image_prefixes` 部分一致バイパス修正、`process_guard.py` の System32 判定バグ修正、`sanitizer.py` による機微情報マスキング、Sysmon ID 255 権限エラーの過剰 CRITICAL 抑止、`tests/` 常設化・公開ドキュメント汎用化を実施。 |
-| `v1.30` | 2026-11-25 | ・プロンプトインジェクション隔離（`<UNTRUSTED_EVENT_DATA>` / `<UNTRUSTED_LOG_SUMMARY>` + Schema強制）、Sysmon ID `14` 対応・ID `8/10` 偽装パス対策・難読化 (`i`ex`, `-ec`, `ieframe.dll`) 対応・ホワイトリスト連結バイパス対策。<br>・`tray_app.py` 15秒巡回と `FlexTriageQueue`（重複統合・上限100）分離、`agent.py` 503/504 連続時30分通常ティア自動退避＋トレイ／CLI（`--standard-tier`）／`runtime_settings.json` 永続切替。<br>・`runtime_settings.py`（原子的JSON書込＋単一インスタンスMutex）、`ui_host.py`（単一Tkinter UIスレッド）、`events_YYYYMMDD.jsonl` 併記出力＋`daily_reviewer.py` / `log_retention.py` 対応、`start_agent.ps1` の `-SyncDeps` / `-StandardTier` 対応を実施。 |
+| `v1.30` (`115c36a`) | 2026-11-25 | ・プロンプトインジェクション隔離（`<UNTRUSTED_EVENT_DATA>` / `<UNTRUSTED_LOG_SUMMARY>` + Schema強制）、Sysmon ID `14` 対応・ID `8/10` 偽装パス対策・難読化 (`i`ex`, `-ec`, `ieframe.dll`) 対応・ホワイトリスト連結バイパス対策。<br>・`tray_app.py` 15秒巡回と `FlexTriageQueue`（重複統合・上限100）分離、`agent.py` 503/504 連続時30分通常ティア自動退避＋トレイ／CLI（`--standard-tier`）／`runtime_settings.json` 永続切替。<br>・`runtime_settings.py`（原子的JSON書込＋単一インスタンスMutex）、`ui_host.py`（単一Tkinter UIスレッド）、`events_YYYYMMDD.jsonl` 併記出力＋`daily_reviewer.py` / `log_retention.py` 対応、`start_agent.ps1` の `-SyncDeps` / `-StandardTier` 対応を実施。 |
+| `v1.31` | 2026-11-25 | ・`posture_check.py`（`winreg` Read-Only LSA/HVCI/TamperProtection/ASR 12ルール診断＋トレイ/CLI `--posture-check` 統合）および `harden_endpoint.ps1`（UTF-8 BOM、Windows PowerShell 5.1 で `Audit` / `ApplyAudit` / `CheckAsrLogs` / `ApplyBlock` / `Rollback`）を追加。 |
 
 ---
 
@@ -70,7 +71,9 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 
 | ファイル | 役割 |
 | :--- | :--- |
-| `config.py` | `APP_VERSION = "1.30"`、監視対象チャネル/ID（ID `14` 追加）、Flex キュー/503/504クールダウン定数、一次スクリーニング条件、保護プロセス一覧 |
+| `config.py` | `APP_VERSION = "1.31"`、監視対象チャネル/ID（ID `14` 追加）、Flex キュー/503/504クールダウン定数、一次スクリーニング条件、保護プロセス一覧 |
+| `posture_check.py` | OS 標準防御設定（LSA 保護・メモリ整合性・Defender ASR 12 ルール）の Read-Only 診断＋GUI表示 |
+| `harden_endpoint.ps1` | UTF-8 (BOM付き) PowerShell スクリプト（ASR 監査/ブロック導入、LSA/HVCI 有効化、`CheckAsrLogs`, `Rollback`） |
 | `runtime_settings.py` | 原子的 JSON 書込 (`atomic_write_json`)、`RuntimeSettings`（Flex/通常ティア永続管理）、Windows 単一インスタンス Mutex |
 | `ui_host.py` | 専用単一スレッド Tkinter ホスト (`tk.Tk` 1つ＋`Toplevel` キューディスパッチ) |
 | `event_reader.py` | `win32evtlog` Read-Only 収集、XML パース、一次スクリーニング（ID `8/10` フルパス厳格化含む）、`checkpoint.json` 原子的管理 |
