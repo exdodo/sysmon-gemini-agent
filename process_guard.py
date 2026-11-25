@@ -289,6 +289,11 @@ def extract_scan_target_paths(event: NormalizedEvent) -> list[str]:
     スクリプト・実行ファイルパスを抽出し、Microsoft Defender で検査すべきファイル一覧を返します。
     """
     candidates: list[str] = []
+    norm_event_img = ""
+    if event.image:
+        expanded_event_img = os.path.expandvars(event.image.strip())
+        if expanded_event_img:
+            norm_event_img = os.path.normcase(os.path.abspath(expanded_event_img))
 
     # 1. コマンドラインおよび親コマンドラインから参照ファイル (.ps1, .vbs, .dll, .exe 等) を抽出
     for cmd_text in (event.command_line or "", event.parent_command_line or ""):
@@ -297,6 +302,9 @@ def extract_scan_target_paths(event: NormalizedEvent) -> list[str]:
             cleaned = match.strip().strip('"').strip("'")
             if os.path.isfile(cleaned):
                 norm = os.path.normcase(os.path.abspath(cleaned))
+                # argv[0] の event.image 自体はステップ2の System32 LOLBin 除外判定に委ねる
+                if norm_event_img and norm == norm_event_img:
+                    continue
                 if norm not in [os.path.normcase(c) for c in candidates]:
                     candidates.append(os.path.abspath(cleaned))
 
@@ -308,8 +316,8 @@ def extract_scan_target_paths(event: NormalizedEvent) -> list[str]:
             # System32 / SysWOW64 配下の正規LOLBin (powershell.exe 等) であり、
             # かつ既にコマンドラインからスクリプトファイルが抽出できている場合はスクリプト検査を優先
             is_system_lolbin = (
-                norm_img.startswith(r"c:\windows\system32\\")
-                or norm_img.startswith(r"c:\windows\syswow64\\")
+                norm_img.startswith("c:\\windows\\system32\\")
+                or norm_img.startswith("c:\\windows\\syswow64\\")
             )
             if not is_system_lolbin or not candidates:
                 if norm_img not in [os.path.normcase(c) for c in candidates]:

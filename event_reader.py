@@ -23,6 +23,7 @@ import xml.etree.ElementTree as ET
 import allowlist
 import config
 import keyword_matcher
+from sanitizer import redact_sensitive_text
 
 logger = logging.getLogger("sysmon_gemini_agent.event_reader")
 
@@ -95,9 +96,9 @@ class NormalizedEvent:
             "UtcTime": self.utc_time,
             "ProcessId": self.process_id,
             "Image": self.image,
-            "CommandLine": self.command_line,
+            "CommandLine": redact_sensitive_text(self.command_line),
             "ParentProcessId": self.parent_process_id,
-            "ParentCommandLine": self.parent_command_line,
+            "ParentCommandLine": redact_sensitive_text(self.parent_command_line),
             "DestinationIp": self.destination_ip,
             "DestinationPort": self.destination_port,
         }
@@ -767,9 +768,18 @@ def screen_event(event: NormalizedEvent) -> tuple[bool, list[str]]:
                 f"[CRITICAL候補] Sysmon 設定変更/ルール改ざん検知 ({event.command_line})"
             )
         elif event.event_id == 255:
-            reasons.append(
-                f"[CRITICAL候補] Sysmon エラー/異常報告 ({event.command_line})"
-            )
+            if "getconfigurationoptions" in cmd_lower and (
+                "error 5" in cmd_lower
+                or "access is denied" in cmd_lower
+                or "アクセスが拒否" in cmd_lower
+            ):
+                reasons.append(
+                    f"Sysmon 設定照会アクセス拒否 (Event ID 255 / 非管理者照会等: {event.command_line})"
+                )
+            else:
+                reasons.append(
+                    f"[CRITICAL候補] Sysmon エラー/異常報告 ({event.command_line})"
+                )
         elif event.event_id == 8:
             _screen_create_remote_thread(event, reasons)
         elif event.event_id == 10:

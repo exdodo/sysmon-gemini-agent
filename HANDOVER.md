@@ -1,10 +1,9 @@
 # HANDOVER.md — `sysmon-gemini-agent` 引き継ぎドキュメント
 
-> **最終更新日**: 2026-11-22  
-> **引き継ぎ元会話**: `Windows Event Log Gemini Monitor`（Conversation ID: `0cd84d29-4734-4dfb-a25f-e34228e217dd`、2026-11-11 〜 2026-11-14）  
-> **対象ワークスペース**: `c:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent`  
+> **最終更新日**: 2026-11-25  
+> **対象ワークスペース**: `<repo-root>\sysmon-gemini-agent`  
 > **リモートリポジトリ**: `https://github.com/exdodo/sysmon-gemini-agent.git`（`main` / `origin/main`）  
-> **現在のリポジトリ最新状態**: `v1.18`（API キー管理を Windows 資格情報マネージャー優先＋固有環境変数 `SYSMON_GEMINI_API_KEY` へ分離）
+> **現在のリポジトリ最新状態**: `v1.20`（セキュリティ修正・機微情報マスキング・テスト常設化・公開ドキュメント汎用化）
 
 ---
 
@@ -34,8 +33,8 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 - **完全 Read-Only 監視・破壊的操作禁止**: `os.remove` / `shutil.rmtree` 等のファイル破棄処理、イベントログ改変・削除、サービス停止、プロセス自動終了は禁止（プロセス停止は `[CRITICAL]` 時にユーザーが GUI ボタンを明示クリックした場合のみ、かつ `PROTECTED_PROCESS_NAMES` で OS 中枢・監視基盤・エディタを保護）。
 - **ファイル書き込み範囲の限定**: `checkpoint.json`, `triage_cache.json`, `allowlist.json`, `alerts/` 配下のみ（インシデントレポートは追記のみ。`log_retention.py` による過去ログ整理も厳密一致の古い日付ファイルのみ対象で当日分は保護）。
 
-### 環境・開発ルール (`C:\Users\Yusuke\.gemini\GEMINI.md` / `GEMINI.md` / `.agent/RULE.md`)
-- **Python / `uv`**: `pip` 単体や Windows Store エイリアス `python.exe` は使用禁止。必ず `C:\Users\Yusuke\.local\bin\uv.exe`（Python 3.13）で `.venv` を管理し、実行は `.\.venv\Scripts\python.exe` または `.\.venv\Scripts\pythonw.exe` を使用する。
+### 環境・開発ルール (`%USERPROFILE%\.gemini\GEMINI.md` / `GEMINI.md` / `.agent/RULE.md`)
+- **Python / `uv`**: `pip` 単体や Windows Store エイリアス `python.exe` は使用禁止。必ず `uv`（Python 3.13）で `.venv` を管理し、実行は `.\.venv\Scripts\python.exe` または `.\.venv\Scripts\pythonw.exe` を使用する。
 - **PowerShell (`.ps1`)**: Windows PowerShell 5.1 の文字化け・構文エラー防止のため、日本語を含む `.ps1` は必ず **UTF-8 (BOM付き: `EF BB BF`)** で保存する。
 - **Gemini SDK・モデル自動追従**:
   - 旧 `google-generativeai` は禁止。必ず `google-genai`（`from google import genai`）＋ Windows 資格情報マネージャー（`keyring`: `sysmon-gemini-agent` / `gemini_api_key`）またはプロジェクト固有環境変数 `SYSMON_GEMINI_API_KEY` を使用（ハードコード・汎用 `GEMINI_API_KEY` の常用禁止）。
@@ -54,13 +53,15 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 | 移行〜初期強化 (`v1.00` / `e32ff89`) | 2026-11-11 〜 11-14 | ・別スレッド（`3eac2caf-...`）からワークスペース引き継ぎ。<br>・`gemini-3.8-flash` → `gemini-4-hydrogen` 変更に伴い、**`auto` モデル自動追従・ランキング・自己修復**を実装し、グローバル/ローカル `GEMINI.md` に標準ルール化。<br>・**Sysmon 改ざん・ログ消去対策（Defense Evasion）**: Sysmon `4/16/255`・Security `1102/4719`・System `104/7036/7040` 追加、`UserData` パース、`EventRecordID` 巻き戻り検知＋チェックポイント自動復旧、`Sysmon64`/`Sysmon`/`EventLog` サービス Heartbeat 監視と停止時の `Security 4688` 自動切替、CLI 無効化コマンド検知を追加。<br>・`APP_VERSION`・`CHANGELOG.md`・`.gitignore`・`GEMINI.md` によるバージョン管理基盤を構築。 |
 | `v1.10` (`7940058`) | 2026-11-14 | ・**監視イベント拡張**: Sysmon ID `8` (スレッド注入), `10` (LSASS 等 ProcessAccess), `11` (不審 FileCreate / ランサムノート), `12/13` (Run/IFEO/Winlogon/UAC/Defender 無効化レジストリ), `22` (DNS/トンネリング) 対応と `sysmon_config.xml` 同梱。<br>・**オフライン/API障害フォールバック**: `classify_offline_severity()`, `investigate_offline()`, 60秒サーキットブレーカー、`--offline` オプションを追加し、`origin/main` へ初回 `git push`。 |
 | `v1.11` (`90ed672`) | 2026-11-14 | ・**オンライン復旧時の再トリアージ＆緑復帰**: オフラインフォールバックで保留されたイベントを復旧後に `try_reinvestigate_online()` で再判定し、オフラインのみが原因で黄/赤になっていた場合は自動で緑アイコンへ復帰させるよう実装。 |
-| `v1.12` (`3295cb4`)<br>& `allowlist.json` (`f4f6cb7`) | 2026-11-14 | ・**ホットリロード対応ホワイトリスト (`allowlist.py`)**: `allowlist.json` による除外、迎撃パネル「許可リスト追加」ボタン、トレイメニュー連携（改ざん・ID `8`/ID `10`・危険キーワードはバイパス禁止ガード付き）。<br>・`uv` 管理 Python ランタイム誤検知抑制、自己 PID 除外、`psutil` による ID `3`/親プロセス補完、`_extract_severity()` 否定文脈誤拾い修正。<br>・ユーザー指示により `C:\Users\Yusuke\.gemini\antigravity\scratch\` 配下の常駐 Python サービス群（`StockPriceDL`, `xbrl_dl` 等）を `allowlist.json` の `trusted_image_prefixes` に登録。 |
+| `v1.12` (`3295cb4`)<br>& `allowlist.json` (`f4f6cb7`) | 2026-11-14 | ・**ホットリロード対応ホワイトリスト (`allowlist.py`)**: `allowlist.json` による除外、迎撃パネル「許可リスト追加」ボタン、トレイメニュー連携（改ざん・ID `8`/ID `10`・危険キーワードはバイパス禁止ガード付き）。<br>・`uv` 管理 Python ランタイム誤検知抑制、自己 PID 除外、`psutil` による ID `3`/親プロセス補完、`_extract_severity()` 否定文脈誤拾い修正。<br>・ローカル開発用常駐スクリプト群を環境内の `allowlist.json` に登録。 |
 | `v1.13` (`6513baa`) | 2026-11-14 | ・**複数行見出し・バッククォート抽出バグ修正**: `### 判定レベル\n\`[SUSPICIOUS]\`` 形式の応答で本文中の `[CRITICAL]` 否定表現を誤認識して迎撃パネルが開く不具合を修正。<br>・オフライン判定時の `uv` Python 過剰 `[CRITICAL]` 昇格抑止、同一 PID 120秒以内の迎撃ダイアログ連続ポップアップ抑止を追加。 |
 | `v1.14` (`3025b4d`)<br>*(別ターンで反映済)* | 2026-11-15 | ・`triage_cache.py` による `[CLEAN]` 24時間 SHA-256 キャッシュ（高リスク/改ざんイベントはキャッシュ除外）。<br>・`[CLEAN]` 時 AI 回答の短文化、`log_retention.py` ＆ `RotatingFileHandler`（5 MB × 5 世代 / 30 日 / 100 MB 上限）を実装。 |
 | `v1.15` (`7e32a7c`) | 2026-11-18 | ・事前リスク別サービスティア振り分け（`[SUSPICIOUS]` 候補はコスト半額の `service_tier="flex"` / 300秒タイムアウト、`[CRITICAL]` 候補は `standard` 即時優先）および混雑時 `standard` 自動フォールバックを実装。 |
-| `v1.16` | 2026-11-19 | ・Gemini 入出力のプレーンテキスト統一（Markdown 装飾 `#`, `**`, `*`, `---` や挨拶の抑止、`_build_initial_prompt` のコンパクト JSON＋プレーンテキスト化）、オフライン/空応答出力の統一、`summarize_clean_report()` の `・` 除去対応を実装。 |
-| `v1.17` | 2026-11-19 | ・`keyword_matcher.py` による一次スクリーニング精密化（`iex` / `bypass` / `hidden` / `-enc` / System32 `rundll32`/`regsvr32` 誤検知解消）。 |
-| `v1.18` | 2026-11-22 | ・`GEMINI_API_KEY` 依存を廃止し、Windows 資格情報マネージャー (`keyring`) 優先＋`SYSMON_GEMINI_API_KEY` フォールバック・`start_agent.ps1` の `-AsSecureString`＋stdin 登録へ移行。 |
+| `v1.16` (`8bff320`) | 2026-11-19 | ・Gemini 入出力のプレーンテキスト統一（Markdown 装飾 `#`, `**`, `*`, `---` や挨拶の抑止、`_build_initial_prompt` のコンパクト JSON＋プレーンテキスト化）、オフライン/空応答出力の統一、`summarize_clean_report()` の `・` 除去対応を実装。 |
+| `v1.17` (`b563554`) | 2026-11-19 | ・`keyword_matcher.py` による一次スクリーニング精密化（`iex` / `bypass` / `hidden` / `-enc` / System32 `rundll32`/`regsvr32` 誤検知解消）。 |
+| `v1.18` (`18fc52e`) | 2026-11-22 | ・`GEMINI_API_KEY` 依存を廃止し、Windows 資格情報マネージャー (`keyring`) 優先＋`SYSMON_GEMINI_API_KEY` フォールバック・`start_agent.ps1` の `-AsSecureString`＋stdin 登録へ移行。 |
+| `v1.19` (`0a83a76`) | 2026-11-24 | ・`daily_reviewer.py` による前日ログの Gemini Flex 日次レビュー、`allowlist_candidates.json` 保留キュー蓄積、および 1 件ずつ確認登録できるステップ UI を追加。 |
+| `v1.20` | 2026-11-25 | ・`allowlist.py` の `trusted_image_prefixes` 部分一致バイパス修正、`process_guard.py` の System32 判定バグ修正、`sanitizer.py` による機微情報マスキング、Sysmon ID 255 権限エラーの過剰 CRITICAL 抑止、`tests/` 常設化・公開ドキュメント汎用化を実施。 |
 
 ---
 
@@ -94,7 +95,7 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 3. **サンドボックス内での Git / API 実行制限**:
    - 本環境では標準サンドボックス内で `.git/index.lock` / タグ作成や外部通信（`git push`, Gemini API 呼び出し）が権限/ネットワーク制限で失敗することがあるため、必要な Git 書き込み・外部 API 検証コマンドのみ `BypassSandbox: true` を使用する。
 4. **テスト資産と検証状況**:
-   - リポジトリ内に常設の `tests/` ディレクトリはまだ存在しない（これまで各バージョンで会話ごとの `scratch/test_v1xx.py` 等により単体テスト・モック検証を実施）。GUI ウィンドウ操作および実機イベントログでの長時間稼働確認は実環境側の起動で確認する運用となっている。
+   - リポジトリ直下の `tests/` ディレクトリに単体テストスイートを常設しており、`.\.venv\Scripts\python.exe -m unittest discover -s tests -v` で一括実行できます。GUI ウィンドウ操作および実機イベントログでの長時間稼働確認は実環境側の起動で確認する運用となっています。
 5. **起動コマンド（クイックリファレンス）**:
    ```powershell
    # 推奨ランチャー（自動管理者昇格・トレイ常駐）

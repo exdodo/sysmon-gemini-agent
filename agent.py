@@ -44,6 +44,7 @@ from event_reader import NormalizedEvent
 import keyword_matcher
 from log_retention import cleanup_old_incident_reports
 from process_guard import verify_target_process
+from sanitizer import redact_sensitive_text
 from tools import AVAILABLE_TOOLS, TOOL_DISPATCH_MAP
 from triage_cache import CleanTriageCache
 
@@ -253,7 +254,10 @@ class GeminiTriageAgent:
         (`to_trimmed_dict()`) と一次スクリーニング検知理由のみをプレーンテキストで整形します。
         """
         trimmed_payload: dict[str, Any] = event.to_trimmed_dict()
-        reasons_str = " / ".join(event.screening_reasons) or "一次フィルタ条件一致"
+        reasons_str = (
+            " / ".join(redact_sensitive_text(r) for r in event.screening_reasons)
+            or "一次フィルタ条件一致"
+        )
 
         return (
             f"Channel: {event.channel}\n"
@@ -992,9 +996,12 @@ class GeminiTriageAgent:
         report_path = self.alerts_dir / f"incident_{date_str}.md"
 
         trimmed = event.to_trimmed_dict()
-        reasons_md = "\n".join(f"  - {r}" for r in event.screening_reasons) or "  - 一次フィルタ一致"
+        reasons_md = "\n".join(
+            f"  - {redact_sensitive_text(r)}" for r in event.screening_reasons
+        ) or "  - 一次フィルタ一致"
         proc_check = verify_target_process(event.process_id, event.image, event.utc_time)
         used_model = model_label or f"{self.model_name} (tier: {self.last_used_service_tier})"
+        safe_report_text = redact_sensitive_text(report_text)
 
         if tool_trace:
             trace_lines = []
@@ -1021,7 +1028,7 @@ class GeminiTriageAgent:
             f"- **一次スクリーニング検知理由**:\n{reasons_md}\n"
             f"- **Gemini 自律調査ツール履歴 (最大 {self.max_depth} 往復中 {len(tool_trace)} 回実行)**:\n{trace_md}\n\n"
             f"### Gemini 分析・判定結果\n\n"
-            f"{report_text}\n"
+            f"{safe_report_text}\n"
         )
 
         # 安全制約に基づき、必ず追記モード (mode="a") のみで書き込む

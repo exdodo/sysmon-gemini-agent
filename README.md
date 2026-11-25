@@ -1,6 +1,6 @@
 # Windows Event Log & Sysmon 監視エージェント (Google Gemini版)
 
-> **Version**: `1.19`（変更履歴は [CHANGELOG.md](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/CHANGELOG.md) を参照）
+> **Version**: `1.20`（変更履歴は [CHANGELOG.md](file:///./CHANGELOG.md) を参照）
 
 Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, `System`）を定期巡回し、**ルールベースの一次スクリーニング**と **Google Gemini (`google-genai` SDK) の自律調査ループ（Function Calling）**、および **オフライン・API障害時のローカル即時フォールバック判定** を組み合わせて、不審なプロセス・インジェクション・永続化・外部通信の兆候を安全かつ低コストにトリアージする監視エージェントです。
 
@@ -55,7 +55,7 @@ Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, 
 - **Python**: Python 3.10 以上
 - **Sysmon (推奨・拡張設定テンプレート同梱)**:
   - Sysinternals Sysmon が導入され、`Microsoft-Windows-Sysmon/Operational` チャネルにイベントが記録されていることを推奨します。
-  - 拡張イベント（ID `8`, `10`, `11`, `12`, `13`, `22`）を有効化しつつ通常時のノイズを抑えるため、同梱の [sysmon_config.xml](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/sysmon_config.xml) を管理者権限の PowerShell から適用できます：
+  - 拡張イベント（ID `8`, `10`, `11`, `12`, `13`, `22`）を有効化しつつ通常時のノイズを抑えるため、同梱の [sysmon_config.xml](file:///./sysmon_config.xml) を管理者権限の PowerShell から適用できます：
     ```powershell
     sysmon64.exe -c .\sysmon_config.xml
     ```
@@ -64,10 +64,10 @@ Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, 
 
 ### 依存ライブラリのインストール（`uv` を使用）
 
-お使いの環境では Python (3.13) がパッケージマネージャ **`uv`** (`C:\Users\Yusuke\.local\bin\uv.exe`) で管理されているため、単体の `pip` コマンドではなく **`uv`** を使用して仮想環境（`.venv`）を作成・インストールします。
+Python (3.13) のパッケージマネージャ **`uv`** を使用して仮想環境（`.venv`）を作成・インストールすることを推奨します（単体の `pip` コマンドより高速に同期できます）。
 
 ```powershell
-cd C:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent
+cd C:\path\to\sysmon-gemini-agent
 
 # 1. 仮想環境 (.venv) の作成
 uv venv --python 3.13
@@ -75,17 +75,17 @@ uv venv --python 3.13
 # 2. 依存パッケージのインストール
 uv pip install -r requirements.txt
 ```
-（※ もし管理者権限の PowerShell で `uv` にパスが通っていない場合は、`C:\Users\Yusuke\.local\bin\uv.exe` とフルパスで指定してください）
+（※ もし管理者権限の PowerShell で `uv` にパスが通っていない場合は、`& "$env:USERPROFILE\.local\bin\uv.exe"` のようにフルパスで指定してください）
 
 ---
 
 ## 3. 実行手順
 
 ### かんたん起動（`start_agent.ps1` を使用 — 推奨）
-[start_agent.ps1](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/start_agent.ps1) を実行すると、**①管理者権限への自動昇格（UAC）**、**②`.venv` と依存パッケージの自動確認**、**③Windows 資格情報マネージャーへの API キー未登録時の安全入力・保存**、**④タスクバー常駐（`--tray`）起動** をワンコマンドで行います。
+[start_agent.ps1](file:///./start_agent.ps1) を実行すると、**①管理者権限への自動昇格（UAC）**、**②`.venv` と依存パッケージの自動確認**、**③Windows 資格情報マネージャーへの API キー未登録時の安全入力・保存**、**④タスクバー常駐（`--tray`）起動** をワンコマンドで行います。
 
 ```powershell
-cd C:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent
+cd C:\path\to\sysmon-gemini-agent
 
 # タスクバー常駐モードで起動（デフォルト）
 powershell -ExecutionPolicy Bypass -File .\start_agent.ps1
@@ -128,7 +128,7 @@ $env:GEMINI_MODEL = "gemini-4-hydrogen"
 
 #### 常駐監視モード（デフォルト: 60秒間隔で巡回）
 ```powershell
-cd C:\Users\Yusuke\.gemini\antigravity\scratch\sysmon-gemini-agent
+cd C:\path\to\sysmon-gemini-agent
 .\.venv\Scripts\python.exe main.py
 ```
 

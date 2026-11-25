@@ -171,17 +171,28 @@ def is_event_allowlisted(
         return (False, "")
 
     rules = load_allowlist(allowlist_path)
-    img_lower = (event.image or "").strip().lower()
-    cmd_lower = (event.command_line or "").strip().lower()
+    img_norm = (event.image or "").strip().replace("/", "\\").lower()
+    img_base = img_norm.rsplit("\\", 1)[-1]
+    is_generic_interp = img_base in GENERIC_INTERPRETER_BASENAMES
+    cmd_raw = (event.command_line or "").strip()
+    cmd_lower = cmd_raw.lower()
+    cmd_scripts = [
+        m.group(1).strip().replace("/", "\\").lower()
+        for m in _SCRIPT_PATH_RE.finditer(cmd_raw)
+    ]
 
     for trusted_img in rules["trusted_images"]:
-        if img_lower and img_lower == trusted_img.lower():
+        if img_norm and img_norm == trusted_img.replace("/", "\\").lower():
             return (True, f"trusted_images 一致: {trusted_img}")
 
     for prefix in rules["trusted_image_prefixes"]:
-        p_low = prefix.lower()
-        if p_low and (p_low in img_lower or p_low in cmd_lower):
+        p_norm = prefix.replace("/", "\\").lower()
+        if not p_norm:
+            continue
+        if img_norm and img_norm.startswith(p_norm):
             return (True, f"trusted_image_prefixes 一致: {prefix}")
+        if is_generic_interp and any(sp.startswith(p_norm) for sp in cmd_scripts):
+            return (True, f"trusted_image_prefixes (スクリプト) 一致: {prefix}")
 
     for pattern in rules["trusted_command_line_contains"]:
         pat_low = pattern.lower()

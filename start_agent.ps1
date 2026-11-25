@@ -93,16 +93,20 @@ if (-not $isAdmin) {
 # ============================================================================
 # 3. uv および 仮想環境 (.venv) の準備
 # ============================================================================
-$UvPath = "C:\Users\Yusuke\.local\bin\uv.exe"
-if (-not (Test-Path -LiteralPath $UvPath)) {
-    $uvCmd = Get-Command uv -ErrorAction SilentlyContinue
-    if ($uvCmd) {
-        $UvPath = $uvCmd.Source
-    } else {
-        Write-Error "uv.exe が見つかりません。パスを確認してください: $UvPath"
-        Read-Host "Enter キーを押して終了します"
-        exit 1
+$UvPath = $null
+$uvCmd = Get-Command uv -ErrorAction SilentlyContinue
+if ($uvCmd) {
+    $UvPath = $uvCmd.Source
+} else {
+    $fallbackUv = Join-Path $env:USERPROFILE ".local\bin\uv.exe"
+    if (Test-Path -LiteralPath $fallbackUv) {
+        $UvPath = $fallbackUv
     }
+}
+if (-not $UvPath) {
+    Write-Error "uv.exe が見つかりません。PATH または `$env:USERPROFILE\.local\bin\uv.exe を確認してください。"
+    Read-Host "Enter キーを押して終了します"
+    exit 1
 }
 
 if (-not (Test-Path -LiteralPath $VenvPython)) {

@@ -2,6 +2,22 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.20] - 2026-11-25
+公開リポジトリ向けセキュリティ・プライバシー監査に基づくバグ修正、機微情報マスキング、システム改善、および恒久テストスイート (`tests/`) の整備を実施。
+
+### 修正・セキュリティ強化
+- **`trusted_image_prefixes` の許可リスト回避リスク解消 (`allowlist.py`)**:
+  - 従来の部分一致 (`p in img or p in cmd`) を廃止し、実行ファイルパスの厳密前方一致 (`img_norm.startswith(p_norm)`) または汎用インタプリタ実行時のスクリプトフルパス前方一致へ修正。
+- **`process_guard.py` の System32 判定バグ修正**:
+  - raw 文字列内の二重バックスラッシュ（`r"c:\windows\system32\\"`）により常に `False` となっていた判定を修正。
+- **Gemini 送信前・ログ保存前の機微情報マスキング (`sanitizer.py`, `event_reader.py`, `agent.py`, `tools.py`)**:
+  - `AIza...` / `ghp_...` / `sk-...` / `Bearer ...` / `--token=...` / `password=...` 等を自動的に伏せ字（`<REDACTED>` 等）へ置換し、API 外部送信および `alerts/incident_*.md` への誤記録を防止。
+- **Sysmon Event ID 255 (`GetConfigurationOptions` 権限エラー) の過剰 `[CRITICAL候補]` 抑止 (`event_reader.py`)**:
+  - `error 5` 等の非管理者設定照会エラーを `[CRITICAL候補]` から除外し、Flex ティアで適切に処理されるよう調整。
+- **ポータブル起動・公開ドキュメント汎用化・テスト常設化 (`start_agent.ps1`, `README.md`, `GEMINI.md`, `HANDOVER.md`, `tests/`)**:
+  - `start_agent.ps1` の `uv.exe` 検出を `Get-Command uv` / `$env:USERPROFILE\.local\bin\uv.exe` へ変更し、個人ユーザー名を含むハードコードパスを解消。
+  - `tests/` 配下に単体テストスイートを常設整備。
+
 ## [1.19] - 2026-11-24
 前日アラートログの日次総合レビュー（Gemini Flex ティア）および保留ホワイトリスト候補の 1 件ずつ確認・登録機能を実装。
 
@@ -120,7 +136,7 @@ Gemini 入出力双方のプレーンテキスト化・簡素化による入出�
   - Sysmon Event ID `8` (`CreateRemoteThread`: スレッド/シェルコード注入)、`10` (`ProcessAccess`: LSASSメモリ読取・高権限アクセス)、`11` (`FileCreate`: スタートアップ/タスク投下・LOLBin/Officeドロップ・ランサムノート検知)、`12`/`13` (`RegistryEvent`: Runキー永続化・IFEO・Winlogon・UACバイパス・Sysmon/Defender無効化)、`22` (`DNSEvent`: LOLBin/Temp名前解決・ダイナミックDNS・DNSトンネリング) のXMLパースおよび専用一次スクリーニングルールを追加。
   - 収集・インメモリキャッシュ上限を拡張 (`MAX_EVENTS_PER_POLL = 1000`, `RECENT_EVENT_CACHE_SIZE = 4000`)。
   - Gemini Read-Only ツール `get_process_related_events(process_id)` を追加し、`get_process_network_activity` も DNS (`ID 22`) を参照可能に拡張。
-  - 低ノイズで拡張イベントを収集できる Sysmon 設定テンプレート [sysmon_config.xml](file:///C:/Users/Yusuke/.gemini/antigravity/scratch/sysmon-gemini-agent/sysmon_config.xml) を同梱。
+  - 低ノイズで拡張イベントを収集できる Sysmon 設定テンプレート [sysmon_config.xml](file:///./sysmon_config.xml) を同梱。
 - **オフライン・API障害時の一次検知フォールバック (`agent.py`, `tray_app.py`, `main.py`, `config.py`)**:
   - Gemini API 通信障害・レート制限超過・タイムアウト時にローカルルール判定（`[CRITICAL]` / `[SUSPICIOUS]`）へ自動切替する `classify_offline_severity()` / `investigate_offline()` および 60秒サーキットブレーカー (`API_OFFLINE_COOLDOWN_SECONDS = 60`) を実装。
   - オフラインフォールバック時も `alerts/incident_YYYYMMDD.md` への追記、トレイアイコンの赤/黄変化・デスクトップ通知、Microsoft Defender 緊急スキャン通報、`[CRITICAL]` 迎撃パネル表示が途切れず動作。

@@ -23,6 +23,7 @@ from event_reader import (
     register_event_in_cache,
     win32evtlog,
 )
+from sanitizer import redact_sensitive_text
 
 logger = logging.getLogger("sysmon_gemini_agent.tools")
 
@@ -163,7 +164,7 @@ def get_parent_process(parent_process_id: int) -> dict:
                 "UtcTime": ev.utc_time,
                 "ProcessId": target_pid,
                 "Image": ev.parent_image,
-                "CommandLine": ev.parent_command_line,
+                "CommandLine": redact_sensitive_text(ev.parent_command_line),
                 "ParentProcessId": None,
                 "ParentCommandLine": "",
                 "DestinationIp": "",
@@ -184,7 +185,7 @@ def get_parent_process(parent_process_id: int) -> dict:
                 "UtcTime": create_utc,
                 "ProcessId": target_pid,
                 "Image": exe_path,
-                "CommandLine": cmdline_str,
+                "CommandLine": redact_sensitive_text(cmdline_str),
                 "ParentProcessId": ppid,
                 "ParentCommandLine": "",
                 "DestinationIp": "",

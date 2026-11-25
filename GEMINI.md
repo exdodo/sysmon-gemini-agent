@@ -1,6 +1,6 @@
 # Project Rules (`sysmon-gemini-agent`)
 
-共通の環境・開発規約（`uv`、PowerShell 文字コード、Gemini SDK・モデル自動追従、操作範囲など）はグローバルの `C:\Users\Yusuke\.gemini\GEMINI.md` に従うこと。本ファイルでは本プロジェクト固有の規約のみを定義する。
+共通の環境・開発規約（`uv`、PowerShell 文字コード、Gemini SDK・モデル自動追従、操作範囲など）はグローバルの `%USERPROFILE%\.gemini\GEMINI.md` に従うこと。本ファイルでは本プロジェクト固有の規約のみを定義する。
 
 ## 1. バージョン管理規約
 - 現在の基準バージョンは `1.00` とし、`config.py` の `APP_VERSION` で一元管理する。
