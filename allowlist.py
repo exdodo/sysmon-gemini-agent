@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Any
 
 import config
 import keyword_matcher
+from runtime_settings import atomic_write_json
 
 if TYPE_CHECKING:
     from event_reader import NormalizedEvent
@@ -74,6 +75,12 @@ _SCRIPT_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
+# コマンド連結記号・難読化・インラインコード実行指定を検出（ホワイトリスト便乗バイパス対策）
+_CHAINING_OR_INLINE_RE = re.compile(
+    r"(?:&&|\|\||[;&|`]|(?:^|\s)(?:-|/)(?:c|cmd|command|ec|enc|encodedcommand)(?=$|\s))",
+    re.IGNORECASE,
+)
+
 
 def _normalize_str_list(raw: Any) -> list[str]:
     if not isinstance(raw, list):
@@ -90,9 +97,7 @@ def ensure_allowlist_file(allowlist_path: Path | None = None) -> Path:
     """`allowlist.json` が存在しない場合、空の初期テンプレートを作成してパスを返します。"""
     target_path = allowlist_path or config.ALLOWLIST_FILE
     if not target_path.exists():
-        serialized = json.dumps(DEFAULT_ALLOWLIST_DATA, indent=2, ensure_ascii=False)
-        with open(target_path, mode="w", encoding="utf-8") as fp:
-            fp.write(serialized + "\n")
+        atomic_write_json(target_path, DEFAULT_ALLOWLIST_DATA)
     return target_path
 
 
@@ -181,6 +186,8 @@ def is_event_allowlisted(
         for m in _SCRIPT_PATH_RE.finditer(cmd_raw)
     ]
 
+    cmd_has_chaining_or_inline = bool(_CHAINING_OR_INLINE_RE.search(cmd_raw))
+
     for trusted_img in rules["trusted_images"]:
         if img_norm and img_norm == trusted_img.replace("/", "\\").lower():
             return (True, f"trusted_images 一致: {trusted_img}")
@@ -191,13 +198,22 @@ def is_event_allowlisted(
             continue
         if img_norm and img_norm.startswith(p_norm):
             return (True, f"trusted_image_prefixes 一致: {prefix}")
-        if is_generic_interp and any(sp.startswith(p_norm) for sp in cmd_scripts):
+        if (
+            is_generic_interp
+            and bool(cmd_scripts)
+            and not cmd_has_chaining_or_inline
+            and all(sp.startswith(p_norm) and ".." not in sp for sp in cmd_scripts)
+        ):
             return (True, f"trusted_image_prefixes (スクリプト) 一致: {prefix}")
 
     for pattern in rules["trusted_command_line_contains"]:
         pat_low = pattern.lower()
-        if pat_low and pat_low in cmd_lower:
-            return (True, f"trusted_command_line_contains 一致: {pattern}")
+        if not pat_low or pat_low not in cmd_lower:
+            continue
+        # パターン自体が連結演算子等を含まない限り、コマンド連結/インライン実行便乗は許可しない
+        if cmd_has_chaining_or_inline and not _CHAINING_OR_INLINE_RE.search(pattern):
+            continue
+        return (True, f"trusted_command_line_contains 一致: {pattern}")
 
     if event.event_id == 22:
         qname = (event.event_details.get("query_name") or "").strip().lower().rstrip(".")
@@ -362,9 +378,7 @@ def add_rule_entry(
             return (True, f"既に許可リストに登録済みです: {cleaned}")
 
         normalized[section_key].append(cleaned)
-        serialized = json.dumps(normalized, indent=2, ensure_ascii=False)
-        with open(target_path, mode="w", encoding="utf-8") as fp:
-            fp.write(serialized + "\n")
+        atomic_write_json(target_path, normalized)
 
         _CACHE_SIGNATURE = None
         _CACHE_DATA = normalized

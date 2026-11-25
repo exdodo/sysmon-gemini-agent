@@ -21,6 +21,7 @@ import config
 from daily_reviewer import DailyReviewer, show_allowlist_review_dialog
 from event_reader import CheckpointManager, NormalizedEvent, WindowsEventReader
 from process_guard import show_critical_response_dialog
+from runtime_settings import SingleInstanceMutex
 
 
 def setup_logging() -> logging.Logger:
@@ -69,6 +70,7 @@ def run_monitoring_loop(
     poll_interval: int = config.POLL_INTERVAL_SECONDS,
     run_once: bool = False,
     offline_only: bool = False,
+    service_tier_override: str | None = None,
 ) -> int:
     """
     定期巡回デーモンのメインループを実行します。
@@ -98,8 +100,13 @@ def run_monitoring_loop(
             max_depth=config.MAX_DEPTH,
             alerts_dir=config.ALERTS_DIR,
             offline_only=offline_only,
+            service_tier_override=service_tier_override,
         )
-        logger.info("有効化された実使用モデル: %s", triage_agent.model_name)
+        logger.info(
+            "有効化された実使用モデル: %s | ティア方針: %s",
+            triage_agent.model_name,
+            triage_agent.get_tier_status_label(),
+        )
     except EnvironmentError as env_err:
         logger.error("初期化エラー: %s", env_err)
         return 1
@@ -243,6 +250,17 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
         help="Gemini API を呼び出さず、ルールベースの一次検知・オフライン判定のみで監視します。",
     )
     parser.add_argument(
+        "--standard-tier",
+        action="store_true",
+        help="Flex ティアを使用せず、通常ティア (standard) のみで Gemini API を呼び出します（503/504 回避）。",
+    )
+    parser.add_argument(
+        "--service-tier",
+        choices=("flex", "standard"),
+        default=None,
+        help="通常イベント向けの Gemini API サービスティアを明示指定します ('flex' または 'standard')。",
+    )
+    parser.add_argument(
         "--daily-review",
         action="store_true",
         help="前日のインシデントログに対する Gemini 日次総合レビューと候補抽出を1回実行して終了します。",
@@ -260,8 +278,15 @@ def parse_args(argv: list[str] | None = None) -> argparse.Namespace:
     return parser.parse_args(argv)
 
 
+def _resolve_service_tier_override(args: argparse.Namespace) -> str | None:
+    if getattr(args, "standard_tier", False):
+        return "standard"
+    return getattr(args, "service_tier", None)
+
+
 if __name__ == "__main__":
     args = parse_args()
+    tier_override = _resolve_service_tier_override(args)
     if args.review_candidates:
         show_allowlist_review_dialog()
         sys.exit(0)
@@ -272,6 +297,7 @@ if __name__ == "__main__":
             max_depth=config.MAX_DEPTH,
             alerts_dir=config.ALERTS_DIR,
             offline_only=args.offline,
+            service_tier_override=tier_override,
         )
         yesterday = (datetime.now().astimezone() - timedelta(days=1)).date()
         res = DailyReviewer(alerts_dir=config.ALERTS_DIR).run_review_for_date(
@@ -281,16 +307,36 @@ if __name__ == "__main__":
         )
         print(res)
         sys.exit(0 if res.get("status") in ("ok", "empty", "no_log", "already_reviewed") else 1)
-    if args.tray:
-        setup_logging()
-        from tray_app import SysmonTrayApp
 
-        app = SysmonTrayApp(poll_interval=args.interval, offline_only=args.offline)
-        sys.exit(app.run())
-    sys.exit(
-        run_monitoring_loop(
-            poll_interval=args.interval,
-            run_once=args.once,
-            offline_only=args.offline,
+    if args.tray or not args.once:
+        logger = setup_logging()
+        with SingleInstanceMutex(config.SINGLE_INSTANCE_MUTEX_NAME) as mutex:
+            if not mutex.acquire():
+                logger.warning("Sysmon Gemini 監視エージェントは既に起動中のため、重複起動を終了します。")
+                sys.exit(0)
+            if args.tray:
+                from tray_app import SysmonTrayApp
+
+                app = SysmonTrayApp(
+                    poll_interval=args.interval,
+                    offline_only=args.offline,
+                    service_tier_override=tier_override,
+                )
+                sys.exit(app.run())
+            sys.exit(
+                run_monitoring_loop(
+                    poll_interval=args.interval,
+                    run_once=args.once,
+                    offline_only=args.offline,
+                    service_tier_override=tier_override,
+                )
+            )
+    else:
+        sys.exit(
+            run_monitoring_loop(
+                poll_interval=args.interval,
+                run_once=args.once,
+                offline_only=args.offline,
+                service_tier_override=tier_override,
+            )
         )
-    )

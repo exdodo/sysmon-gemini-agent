@@ -40,7 +40,6 @@ _TRUSTED_BARE_RUNDLL32_TARGETS: frozenset[str] = frozenset(
         "firewall.cpl",
         "hotplug.dll",
         "iedkcs32.dll",
-        "ieframe.dll",
         "iernonce.dll",
         "inetcpl.cpl",
         "intl.cpl",
@@ -59,7 +58,6 @@ _TRUSTED_BARE_RUNDLL32_TARGETS: frozenset[str] = frozenset(
         "powrprof.dll",
         "printui.dll",
         "sendmail.dll",
-        "shdocvw.dll",
         "shell32.dll",
         "shwebsvc.dll",
         "srchadmin.dll",
@@ -86,6 +84,7 @@ _ABUSED_RUNDLL32_RE = re.compile(
     r"|syssetup\.dll|setupapi\.dll"
     r"|shell32\.dll[,;\s]+shellexec_rundll"
     r"|url\.dll[,;\s]+fileprotocolhandler"
+    r"|ieframe\.dll|shdocvw\.dll"
     r"|zipfldr\.dll|scrobj\.dll"
     r"|\\appdata\\|\\temp\\|\\users\\public\\|\\programdata\\"
     r")",
@@ -94,14 +93,15 @@ _ABUSED_RUNDLL32_RE = re.compile(
 
 _UNC_PATH_RE = re.compile(r"(?:^|[\s\"'])\\\\(?![.?]\\)")
 _ARG_TOKEN_RE = re.compile(r'"([^"]*)"|\'([^\']*)\'|(\S+)')
+_DEOBFUSCATE_RE = re.compile(r"[`^]+(?=[A-Za-z0-9_/-])")
 
 # (キーワード表示名, 正規表現, HIGH_RISK判定用フラグ)
 KEYWORD_RULES: tuple[tuple[str, re.Pattern[str], bool], ...] = (
     (
         "-enc",
         re.compile(
-            r"(?:^|[\s\"'])(?:-|/)(?:enc|encodedcommand)(?=$|[\s\"':=])"
-            r"|(?:^|\s)[-/]e(?:n|nc|nco|ncod|ncode|ncoded(?:command)?)?\s+[A-Za-z0-9+/]{16,}={0,2}(?=$|\s)",
+            r"(?:^|[\s\"'])(?:-|/)(?:ec|enc|encodedcommand)(?=$|[\s\"':=])"
+            r"|(?:^|\s)[-/]e(?:c|n|nc|nco|ncod|ncode|ncoded(?:command)?)?\s+[A-Za-z0-9+/]{16,}={0,2}(?=$|\s)",
             re.IGNORECASE,
         ),
         True,
@@ -132,6 +132,11 @@ KEYWORD_RULES: tuple[tuple[str, re.Pattern[str], bool], ...] = (
     ),
     ("invoke-expression", re.compile(r"\binvoke-expression\b", re.IGNORECASE), True),
     ("invoke-webrequest", re.compile(r"\binvoke-webrequest\b", re.IGNORECASE), False),
+    (
+        "invoke-restmethod",
+        re.compile(r"(?:^|[\s\"'(|;&])(?:irm|invoke-restmethod)(?=$|[\s(\"'`;|&])", re.IGNORECASE),
+        False,
+    ),
     (
         "certutil -urlcache",
         re.compile(r"\bcertutil(?:\.exe)?\s+(?:.*\s)?[-/]urlcache\b", re.IGNORECASE),
@@ -201,12 +206,21 @@ def _is_system32_dll_path(path_str: str) -> bool:
     return norm.startswith(_SYSTEM32_DIR_PREFIXES)
 
 
+def _deobfuscate_command_line(text: str) -> str:
+    """PowerShell バッククォート (``i`ex``) や cmd キャレット (``^b^y^p^a^s^s``) 難読化を解除した照合用文字列を返します。"""
+    if not text:
+        return ""
+    if "`" not in text and "^" not in text:
+        return text
+    return _DEOBFUSCATE_RE.sub("", text)
+
+
 def _is_benign_system_rundll32(command_line: str, image: str = "") -> bool:
     """
     正規の Windows System32/SysWOW64 配下の rundll32.exe が安全な OS 標準 DLL/CPL を
     呼び出している場合のみ True を返します。
     """
-    if not command_line:
+    if not command_line or "`" in command_line or "^" in command_line:
         return False
     if _ABUSED_RUNDLL32_RE.search(command_line) or _UNC_PATH_RE.search(command_line):
         return False
@@ -261,7 +275,7 @@ def _is_benign_system_regsvr32(command_line: str, image: str = "") -> bool:
     正規 System32/SysWOW64 の regsvr32.exe が /i:URL や scrobj.dll を伴わず
     System32/SysWOW64 配下の DLL/OCX のみを登録する場合に True を返します。
     """
-    if not command_line:
+    if not command_line or "`" in command_line or "^" in command_line:
         return False
     lower = command_line.lower()
     if any(tok in lower for tok in ("http://", "https://", "ftp://", "scrobj.dll", "/i:", "-i:")):
@@ -292,13 +306,16 @@ def _is_benign_system_regsvr32(command_line: str, image: str = "") -> bool:
 
 
 def find_suspicious_keywords(command_line: str, image: str = "") -> list[str]:
-    """コマンドライン文字列から精密ルールに合致した不審キーワード名リストを返します。"""
+    """コマンドライン文字列（およびバッククォート/キャレット難読化解除文字列）から精密ルールに合致した不審キーワード名リストを返します。"""
     if not command_line:
         return []
 
+    normalized_cmd = _deobfuscate_command_line(command_line)
     matched: list[str] = []
     for label, pattern, _ in KEYWORD_RULES:
-        if not pattern.search(command_line):
+        hit_raw = bool(pattern.search(command_line))
+        hit_norm = normalized_cmd != command_line and bool(pattern.search(normalized_cmd))
+        if not (hit_raw or hit_norm):
             continue
         if label == "rundll32" and _is_benign_system_rundll32(command_line, image=image):
             continue
@@ -333,4 +350,9 @@ def has_never_allowlist_keyword(text: str) -> bool:
     """許可リスト適用不可の絶対警戒キーワードが単語境界一致で含まれるかを返します。"""
     if not text:
         return False
-    return bool(_NEVER_ALLOWLIST_RE.search(text))
+    if _NEVER_ALLOWLIST_RE.search(text):
+        return True
+    normalized = _deobfuscate_command_line(text)
+    if normalized != text and _NEVER_ALLOWLIST_RE.search(normalized):
+        return True
+    return False

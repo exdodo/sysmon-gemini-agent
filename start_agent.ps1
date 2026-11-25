@@ -25,7 +25,11 @@ param(
     [ValidateSet("Tray", "TraySilent", "TrayConsole", "Console", "Once")]
     [string]$Mode = "Tray",
 
-    [int]$Interval = 15
+    [int]$Interval = 15,
+
+    [switch]$SyncDeps,
+
+    [switch]$StandardTier
 )
 
 $ErrorActionPreference = "Stop"
@@ -79,6 +83,12 @@ if (-not $isAdmin) {
         "-Mode", $Mode,
         "-Interval", $Interval
     )
+    if ($SyncDeps) {
+        $argList += "-SyncDeps"
+    }
+    if ($StandardTier) {
+        $argList += "-StandardTier"
+    }
 
     # APIキーが既に登録されており、ウィンドウ非表示のTrayモードであれば昇格ウィンドウも最小限にする
     if (($Mode -in @("Tray", "TraySilent")) -and $HasApiKeyBeforeElevation) {
@@ -109,16 +119,19 @@ if (-not $UvPath) {
     exit 1
 }
 
-if (-not (Test-Path -LiteralPath $VenvPython)) {
+$NeedVenvCreate = -not (Test-Path -LiteralPath $VenvPython)
+if ($NeedVenvCreate) {
     Write-Host "[セットアップ] 仮想環境 (.venv) を作成しています..." -ForegroundColor Green
     & $UvPath venv --python 3.13
 }
 
-# 必須パッケージ (pystray, Pillow, psutil, google-genai, keyring, pywin32 等) を uv で高速同期
-$prevErrorAction = $ErrorActionPreference
-$ErrorActionPreference = "Continue"
-& $UvPath pip install -r (Join-Path $ProjectDir "requirements.txt") --quiet
-$ErrorActionPreference = $prevErrorAction
+# 管理者権限での不要な毎回パッケージ同期を避け、初回構築時または -SyncDeps 指定時のみ依存同期
+if ($NeedVenvCreate -or $SyncDeps) {
+    $prevErrorAction = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+    & $UvPath pip install -r (Join-Path $ProjectDir "requirements.txt") --quiet
+    $ErrorActionPreference = $prevErrorAction
+}
 
 # ============================================================================
 # 4. APIキー未登録時の対話入力（Windows 資格情報マネージャーへ保存）
@@ -157,25 +170,30 @@ if (-not (Test-GeminiApiKeyAvailable)) {
 # 5. エージェントの起動
 # ============================================================================
 $MainPy = Join-Path $ProjectDir "main.py"
+$TierArgs = @()
+if ($StandardTier) {
+    $TierArgs += "--standard-tier"
+}
 
 switch ($Mode) {
     { $_ -in @("Tray", "TraySilent") } {
         # pythonw.exe を使い、PowerShell の黒い画面を残さずタスクバーアイコンのみで常駐
-        Start-Process -FilePath $VenvPythonw -ArgumentList @("`"$MainPy`"", "--tray", "--interval", "$Interval") -WorkingDirectory $ProjectDir -WindowStyle Hidden
+        $procArgs = @("`"$MainPy`"", "--tray", "--interval", "$Interval") + $TierArgs
+        Start-Process -FilePath $VenvPythonw -ArgumentList $procArgs -WorkingDirectory $ProjectDir -WindowStyle Hidden
         Write-Host "[起動完了] バックグラウンドでタスクバー常駐を開始しました（黒い画面は自動的に閉じます）。" -ForegroundColor Green
         exit 0
     }
     "TrayConsole" {
         Write-Host "[起動] タスクバー常駐 + コンソール表示モードで起動します..." -ForegroundColor Green
-        & $VenvPython $MainPy --tray --interval $Interval
+        & $VenvPython $MainPy --tray --interval $Interval @TierArgs
     }
     "Console" {
         Write-Host "[起動] コンソール常駐モードで起動します (Ctrl+C で安全に停止)..." -ForegroundColor Green
-        & $VenvPython $MainPy --interval $Interval
+        & $VenvPython $MainPy --interval $Interval @TierArgs
     }
     "Once" {
         Write-Host "[起動] 1サイクル動作確認モード (--once) で実行します..." -ForegroundColor Green
-        & $VenvPython $MainPy --once
+        & $VenvPython $MainPy --once @TierArgs
         Write-Host ""
         Read-Host "実行が完了しました。Enter キーを押してウィンドウを閉じます"
     }

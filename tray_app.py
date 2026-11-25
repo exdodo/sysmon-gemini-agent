@@ -12,6 +12,7 @@ pystray と Pillow (PIL) を使用してタスクバー（システムトレイ�
 
 from __future__ import annotations
 
+from collections import deque
 from datetime import datetime, timedelta
 import ctypes
 import logging
@@ -30,6 +31,8 @@ from daily_reviewer import (
 )
 from event_reader import CheckpointManager, NormalizedEvent, WindowsEventReader
 from process_guard import show_critical_response_dialog, verify_target_process
+from triage_cache import compute_event_fingerprint
+from ui_host import shutdown_ui_host
 
 logger = logging.getLogger("sysmon_gemini_agent.tray")
 
@@ -104,6 +107,78 @@ def create_status_icon_image(state: str = STATE_NORMAL, size: int = 64) -> Any:
     return img
 
 
+class FlexTriageQueue:
+    """
+    [SUSPICIOUS] イベントを 15 秒巡回ループから切り離して非同期処理するための
+    フィンガープリント重複統合付き・上限付きワーカキュー。
+    """
+
+    def __init__(self, max_size: int = config.FLEX_QUEUE_MAX_SIZE) -> None:
+        self.max_size: int = max(int(max_size), 1)
+        self._cond = threading.Condition()
+        self._queue: deque[tuple[str, NormalizedEvent]] = deque()
+        self._pending_fps: set[str] = set()
+        self._deduplicated_count: int = 0
+        self._overflow_count: int = 0
+
+    def enqueue(self, event: NormalizedEvent) -> tuple[str, int]:
+        """
+        イベントをキューへ追加します。
+        戻り値: (状態: 'enqueued' | 'deduplicated' | 'overflow', 現在の待機件数)
+        """
+        fp = compute_event_fingerprint(event)
+        with self._cond:
+            if fp in self._pending_fps:
+                self._deduplicated_count += 1
+                return ("deduplicated", len(self._queue))
+            if len(self._queue) >= self.max_size:
+                self._overflow_count += 1
+                return ("overflow", len(self._queue))
+            self._queue.append((fp, event))
+            self._pending_fps.add(fp)
+            self._cond.notify_all()
+            return ("enqueued", len(self._queue))
+
+    def dequeue(
+        self,
+        timeout: float = 1.0,
+        stop_event: threading.Event | None = None,
+    ) -> NormalizedEvent | None:
+        """次の処理対象イベントを取り出します（待機キューが空なら timeout まで待機）。"""
+        deadline = time.monotonic() + max(timeout, 0.0)
+        with self._cond:
+            while not self._queue:
+                if stop_event is not None and stop_event.is_set():
+                    return None
+                remaining = deadline - time.monotonic()
+                if remaining <= 0:
+                    return None
+                self._cond.wait(timeout=remaining)
+                if not self._queue and stop_event is not None and stop_event.is_set():
+                    return None
+                if not self._queue and time.monotonic() >= deadline:
+                    return None
+            fp, event = self._queue.popleft()
+            self._pending_fps.discard(fp)
+            return event
+
+    def size(self) -> int:
+        with self._cond:
+            return len(self._queue)
+
+    def wake(self) -> None:
+        with self._cond:
+            self._cond.notify_all()
+
+    def get_stats(self) -> dict[str, int]:
+        with self._cond:
+            return {
+                "pending": len(self._queue),
+                "deduplicated": self._deduplicated_count,
+                "overflow": self._overflow_count,
+            }
+
+
 class SysmonTrayApp:
     """
     タスクバー（通知領域）に常駐し、深刻なアラートやエラー発生時に
@@ -114,6 +189,7 @@ class SysmonTrayApp:
         self,
         poll_interval: int = config.POLL_INTERVAL_SECONDS,
         offline_only: bool = False,
+        service_tier_override: str | None = None,
     ) -> None:
         if not HAS_TRAY_DEPS or pystray is None:
             raise ImportError(
@@ -123,6 +199,7 @@ class SysmonTrayApp:
 
         self.poll_interval: int = poll_interval
         self.offline_only: bool = offline_only
+        self.service_tier_override: str | None = service_tier_override
         self.current_state: str = STATE_NORMAL
         self.status_message: str = "初期化中..."
         self.last_report_path: str = ""
@@ -133,11 +210,13 @@ class SysmonTrayApp:
         self._stop_event = threading.Event()
         self._scan_now_event = threading.Event()
         self._daily_review_now_event = threading.Event()
+        self._agent_ready_event = threading.Event()
         self._lock = threading.Lock()
 
         self.checkpoint_mgr = CheckpointManager(config.CHECKPOINT_FILE)
         self.event_reader = WindowsEventReader(self.checkpoint_mgr)
         self.triage_agent: GeminiTriageAgent | None = None
+        self.flex_queue = FlexTriageQueue(max_size=config.FLEX_QUEUE_MAX_SIZE)
         self.candidate_store = AllowlistCandidateStore()
         self.daily_reviewer = DailyReviewer(
             alerts_dir=config.ALERTS_DIR,
@@ -151,8 +230,45 @@ class SysmonTrayApp:
             menu=self._build_menu(),
         )
 
+    def _get_tier_menu_status(self) -> str:
+        agent = self.triage_agent
+        q_size = self.flex_queue.size()
+        if agent is None:
+            return f"初期化中 | 待機: {q_size}件"
+        return f"{agent.get_tier_status_label()} | 待機: {q_size}件"
+
+    def _is_tier_mode(self, mode: str) -> bool:
+        agent = self.triage_agent
+        if agent is None:
+            return (self.service_tier_override or config.GEMINI_SERVICE_TIER) == mode
+        return agent.get_configured_service_tier() == mode
+
+    def _is_flex_in_cooldown(self) -> bool:
+        agent = self.triage_agent
+        return bool(agent is not None and agent.is_flex_in_cooldown())
+
     def _build_menu(self) -> Any:
         """タスクバーアイコンを右クリックした際のメニューを構築します。"""
+        tier_submenu = pystray.Menu(
+            pystray.MenuItem(
+                "Flex優先 (50%オフ・503/504時30分自動退避)",
+                self._on_set_tier_flex,
+                checked=lambda item: self._is_tier_mode("flex"),
+                enabled=lambda item: not self.offline_only,
+            ),
+            pystray.MenuItem(
+                "通常処理固定 (standard・503/504回避/安定応答)",
+                self._on_set_tier_standard,
+                checked=lambda item: self._is_tier_mode("standard"),
+                enabled=lambda item: not self.offline_only,
+            ),
+            pystray.Menu.SEPARATOR,
+            pystray.MenuItem(
+                "Flex 503/504 クールダウンを今すぐ解除",
+                self._on_reset_flex_cooldown,
+                enabled=lambda item: (not self.offline_only) and self._is_flex_in_cooldown(),
+            ),
+        )
         return pystray.Menu(
             pystray.MenuItem(
                 f"Sysmon Gemini 監視 v{config.APP_VERSION}",
@@ -164,8 +280,14 @@ class SysmonTrayApp:
                 action=None,
                 enabled=False,
             ),
+            pystray.MenuItem(
+                lambda item: f"ティア: {self._get_tier_menu_status()}",
+                action=None,
+                enabled=False,
+            ),
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("今すぐ巡回を実行", self._on_scan_now),
+            pystray.MenuItem("サービスティア切替 (Flex / 通常)", tier_submenu),
             pystray.MenuItem("直近のCRITICAL迎撃パネル (Suspend/Kill) を開く", self._on_open_critical_dialog),
             pystray.MenuItem(
                 lambda item: f"ホワイトリスト候補を確認・登録 ({self.candidate_store.pending_count()}件)",
@@ -179,6 +301,45 @@ class SysmonTrayApp:
             pystray.Menu.SEPARATOR,
             pystray.MenuItem("安全に終了 (Exit)", self._on_exit),
         )
+
+    def _on_set_tier_flex(self, icon: Any, item: Any) -> None:
+        if self.triage_agent is None or self.offline_only:
+            return
+        self.triage_agent.set_configured_service_tier("flex", persist=True)
+        self._refresh_tray_menu()
+        try:
+            self.icon.notify(
+                "通常イベントのサービスティアを「Flex優先 (コスト50%オフ)」へ切り替えました。",
+                "Sysmon Gemini ティア設定変更",
+            )
+        except Exception:
+            pass
+
+    def _on_set_tier_standard(self, icon: Any, item: Any) -> None:
+        if self.triage_agent is None or self.offline_only:
+            return
+        self.triage_agent.set_configured_service_tier("standard", persist=True)
+        self._refresh_tray_menu()
+        try:
+            self.icon.notify(
+                "Flex を停止し、「通常処理固定 (standard)」へ切り替えました（即時適用）。",
+                "Sysmon Gemini ティア設定変更",
+            )
+        except Exception:
+            pass
+
+    def _on_reset_flex_cooldown(self, icon: Any, item: Any) -> None:
+        if self.triage_agent is None or self.offline_only:
+            return
+        self.triage_agent.reset_flex_cooldown()
+        self._refresh_tray_menu()
+        try:
+            self.icon.notify(
+                "Flex 503/504 回避クールダウンを解除し、Flex ティア利用を再開しました。",
+                "Sysmon Gemini ティア設定変更",
+            )
+        except Exception:
+            pass
 
     def set_status(self, new_state: str, message: str, notify_title: str | None = None) -> None:
         """
@@ -245,6 +406,7 @@ class SysmonTrayApp:
         """前日ログの Gemini 日次レビューを手動トリガーします。"""
         logger.info("ユーザー操作により前日ログの日次レビューがリクエストされました。")
         self._daily_review_now_event.set()
+        self.flex_queue.wake()
         self._scan_now_event.set()
 
     def _on_open_alerts_dir(self, icon: Any, item: Any) -> None:
@@ -287,7 +449,9 @@ class SysmonTrayApp:
         self._stop_event.set()
         self._daily_review_now_event.set()
         self._scan_now_event.set()
+        self.flex_queue.wake()
         self.checkpoint_mgr.save()
+        shutdown_ui_host()
         self.icon.stop()
 
     @staticmethod
@@ -349,6 +513,7 @@ class SysmonTrayApp:
                 candidate.process_id,
                 candidate.image,
                 candidate.utc_time,
+                expected_command_line=candidate.command_line if candidate.event_id == 1 else "",
             )
             alive_tag = (
                 "稼働中・迎撃可"
@@ -467,6 +632,14 @@ class SysmonTrayApp:
                 force=True,
             )
         else:
+            q_size = self.flex_queue.size()
+            if q_size >= config.FLEX_DAILY_REVIEW_DEFER_THRESHOLD:
+                logger.info(
+                    "Flex 待機キュー混雑中のため自動日次レビューを延期します (待機=%d件 >= 閾値%d件)。",
+                    q_size,
+                    config.FLEX_DAILY_REVIEW_DEFER_THRESHOLD,
+                )
+                return
             review_res = self.daily_reviewer.run_if_due(self.triage_agent)
 
         if not review_res:
@@ -496,8 +669,23 @@ class SysmonTrayApp:
             except Exception:
                 pass
 
+    def _process_single_candidate(self, candidate: NormalizedEvent) -> None:
+        assert self.triage_agent is not None
+        try:
+            result = self.triage_agent.investigate_event(candidate)
+        except Exception as cand_exc:
+            logger.error(
+                "EventRecordID=%d の調査中に予期しない例外が発生したため、オフラインフォールバックを実行します: %s",
+                candidate.event_record_id,
+                cand_exc,
+            )
+            result = self.triage_agent.investigate_offline(
+                candidate, error_reason=str(cand_exc)
+            )
+        self._apply_triage_result(candidate, result, from_reconciliation=False)
+
     def _monitoring_worker(self) -> None:
-        """バックグラウンドで定期巡回とトリアージを行うワーカースレッド。"""
+        """バックグラウンドで 15 秒ごとのイベントログ定期巡回と CRITICAL 即時処理を行うワーカースレッド。"""
         if not self._is_admin():
             logger.warning("管理者権限なしで起動されました。イベントログの読み取りに失敗する可能性があります。")
             self._active_confirmed_alert = True
@@ -513,13 +701,16 @@ class SysmonTrayApp:
                 max_depth=config.MAX_DEPTH,
                 alerts_dir=config.ALERTS_DIR,
                 offline_only=self.offline_only,
+                service_tier_override=self.service_tier_override,
             )
+            self._agent_ready_event.set()
             if self.current_state != STATE_CRITICAL:
                 mode_label = "オフラインルール監視" if self.offline_only else self.triage_agent.model_name
                 self.set_status(STATE_NORMAL, f"正常監視中 ({mode_label})")
         except Exception as init_exc:
             logger.error("Gemini エージェントの初期化エラー: %s", init_exc)
             self._active_confirmed_alert = True
+            self._agent_ready_event.set()
             self.set_status(
                 STATE_CRITICAL,
                 f"初期化エラー: {init_exc}",
@@ -531,29 +722,39 @@ class SysmonTrayApp:
             try:
                 candidates = self.event_reader.poll_suspicious_candidates()
                 if candidates:
-                    logger.warning("不審候補を %d 件検出。トリアージを実行します。", len(candidates))
+                    logger.warning("不審候補を %d 件検出。トリアージへ振り分けます。", len(candidates))
                     for candidate in candidates:
                         if self._stop_event.is_set():
                             break
-                        try:
-                            result = self.triage_agent.investigate_event(candidate)
-                        except Exception as cand_exc:
-                            logger.error(
-                                "EventRecordID=%d の調査中に予期しない例外が発生したため、オフラインフォールバックを実行します: %s",
-                                candidate.event_record_id,
-                                cand_exc,
-                            )
-                            result = self.triage_agent.investigate_offline(
-                                candidate, error_reason=str(cand_exc)
-                            )
+                        if self.offline_only:
+                            self._process_single_candidate(candidate)
+                            continue
 
-                        self._apply_triage_result(candidate, result, from_reconciliation=False)
+                        pre_severity = self.triage_agent.classify_offline_severity(candidate)
+                        if pre_severity == config.SEVERITY_CRITICAL:
+                            # CRITICAL 候補は Flex 待機列をバイパスし即時 standard ティアで調査
+                            self._process_single_candidate(candidate)
+                        else:
+                            q_status, q_len = self.flex_queue.enqueue(candidate)
+                            if q_status == "overflow":
+                                logger.warning(
+                                    "Flex 待機キュー上限 (%d件) 超過のため EventRecordID=%d を即時オフライン判定します。",
+                                    self.flex_queue.max_size,
+                                    candidate.event_record_id,
+                                )
+                                res = self.triage_agent.investigate_offline(
+                                    candidate,
+                                    error_reason="Flex待機キュー上限超過のためローカル即時判定",
+                                )
+                                self._apply_triage_result(candidate, res, from_reconciliation=False)
+                            elif q_status == "deduplicated":
+                                logger.debug(
+                                    "同一フィンガープリントの待機中イベントを重複統合しました (RecordID=%d, 待機=%d件)",
+                                    candidate.event_record_id,
+                                    q_len,
+                                )
 
-                # オフラインフォールバック保留分があればオンライン復旧後に再判定し、条件を満たせば緑色へ自動復帰
-                self._reconcile_pending_offline_alerts()
-
-                # 1日1回の前日ログ総合レビュー＆ホワイトリスト候補抽出 (Flexモード)
-                self._maybe_run_daily_review()
+                    self._refresh_tray_menu()
 
                 self.checkpoint_mgr.save()
 
@@ -573,17 +774,56 @@ class SysmonTrayApp:
         self.checkpoint_mgr.save()
         logger.info("バックグラウンド監視スレッドが正常に終了しました。")
 
+    def _flex_triage_worker(self) -> None:
+        """
+        [SUSPICIOUS] イベントの待機キュー・オフライン保留分のオンライン再判定・日次レビューを
+        15 秒巡回スレッドから分離して順次実行するワーカースレッド。
+        """
+        while not self._stop_event.is_set():
+            if self._agent_ready_event.wait(timeout=1.0):
+                break
+        if self._stop_event.is_set() or self.triage_agent is None:
+            return
+
+        while not self._stop_event.is_set():
+            try:
+                queued_event = self.flex_queue.dequeue(timeout=2.0, stop_event=self._stop_event)
+                if self._stop_event.is_set():
+                    break
+                if queued_event is not None:
+                    self._process_single_candidate(queued_event)
+                    self._refresh_tray_menu()
+                    continue
+
+                # キューが空のタイミングでオフライン再判定・日次レビューを実行
+                self._reconcile_pending_offline_alerts()
+                self._maybe_run_daily_review()
+            except Exception as exc:
+                logger.error("非同期トリアージスレッド内でエラーが発生しました: %s", exc)
+                time.sleep(2.0)
+
+        logger.info("非同期 Flex トリアージスレッドが正常に終了しました。")
+
     def run(self) -> int:
-        """ワーカースレッドを開始し、タスクバーアイコンのイベントループを実行します。"""
-        worker = threading.Thread(
+        """監視スレッドと非同期トリアージスレッドを開始し、タスクバーアイコンのイベントループを実行します。"""
+        monitor_worker = threading.Thread(
             target=self._monitoring_worker,
             name="SysmonGeminiMonitorThread",
             daemon=True,
         )
-        worker.start()
+        triage_worker = threading.Thread(
+            target=self._flex_triage_worker,
+            name="SysmonGeminiFlexTriageThread",
+            daemon=True,
+        )
+        monitor_worker.start()
+        triage_worker.start()
         self.icon.run()
         self._stop_event.set()
         self._daily_review_now_event.set()
         self._scan_now_event.set()
-        worker.join(timeout=5.0)
+        self.flex_queue.wake()
+        shutdown_ui_host()
+        monitor_worker.join(timeout=5.0)
+        triage_worker.join(timeout=5.0)
         return 0

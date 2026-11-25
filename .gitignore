@@ -186,4 +186,5 @@ allowlist.json
 allowlist_candidates.json
 daily_review_state.json
 triage_cache.json
+runtime_settings.json
 *.tmp

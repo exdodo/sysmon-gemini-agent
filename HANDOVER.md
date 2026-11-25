@@ -3,7 +3,7 @@
 > **最終更新日**: 2026-11-25  
 > **対象ワークスペース**: `<repo-root>\sysmon-gemini-agent`  
 > **リモートリポジトリ**: `https://github.com/exdodo/sysmon-gemini-agent.git`（`main` / `origin/main`）  
-> **現在のリポジトリ最新状態**: `v1.20`（セキュリティ修正・機微情報マスキング・テスト常設化・公開ドキュメント汎用化）
+> **現在のリポジトリ最新状態**: `v1.30`（全9項目のセキュリティ/検知/構造改善 ＋ Flexキュー分離 ＋ 503/504自動クールダウン＆通常処理切替）
 
 ---
 
@@ -61,7 +61,8 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 | `v1.17` (`b563554`) | 2026-11-19 | ・`keyword_matcher.py` による一次スクリーニング精密化（`iex` / `bypass` / `hidden` / `-enc` / System32 `rundll32`/`regsvr32` 誤検知解消）。 |
 | `v1.18` (`18fc52e`) | 2026-11-22 | ・`GEMINI_API_KEY` 依存を廃止し、Windows 資格情報マネージャー (`keyring`) 優先＋`SYSMON_GEMINI_API_KEY` フォールバック・`start_agent.ps1` の `-AsSecureString`＋stdin 登録へ移行。 |
 | `v1.19` (`0a83a76`) | 2026-11-24 | ・`daily_reviewer.py` による前日ログの Gemini Flex 日次レビュー、`allowlist_candidates.json` 保留キュー蓄積、および 1 件ずつ確認登録できるステップ UI を追加。 |
-| `v1.20` | 2026-11-25 | ・`allowlist.py` の `trusted_image_prefixes` 部分一致バイパス修正、`process_guard.py` の System32 判定バグ修正、`sanitizer.py` による機微情報マスキング、Sysmon ID 255 権限エラーの過剰 CRITICAL 抑止、`tests/` 常設化・公開ドキュメント汎用化を実施。 |
+| `v1.20` (`0631eff`) | 2026-11-25 | ・`allowlist.py` の `trusted_image_prefixes` 部分一致バイパス修正、`process_guard.py` の System32 判定バグ修正、`sanitizer.py` による機微情報マスキング、Sysmon ID 255 権限エラーの過剰 CRITICAL 抑止、`tests/` 常設化・公開ドキュメント汎用化を実施。 |
+| `v1.30` | 2026-11-25 | ・プロンプトインジェクション隔離（`<UNTRUSTED_EVENT_DATA>` / `<UNTRUSTED_LOG_SUMMARY>` + Schema強制）、Sysmon ID `14` 対応・ID `8/10` 偽装パス対策・難読化 (`i`ex`, `-ec`, `ieframe.dll`) 対応・ホワイトリスト連結バイパス対策。<br>・`tray_app.py` 15秒巡回と `FlexTriageQueue`（重複統合・上限100）分離、`agent.py` 503/504 連続時30分通常ティア自動退避＋トレイ／CLI（`--standard-tier`）／`runtime_settings.json` 永続切替。<br>・`runtime_settings.py`（原子的JSON書込＋単一インスタンスMutex）、`ui_host.py`（単一Tkinter UIスレッド）、`events_YYYYMMDD.jsonl` 併記出力＋`daily_reviewer.py` / `log_retention.py` 対応、`start_agent.ps1` の `-SyncDeps` / `-StandardTier` 対応を実施。 |
 
 ---
 
@@ -69,8 +70,10 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 
 | ファイル | 役割 |
 | :--- | :--- |
-| `config.py` | `APP_VERSION = "1.18"`、監視対象チャネル/ID、一次スクリーニング条件、Gemini モデル・資格情報設定、`MAX_DEPTH = 3`、キャッシュ/ログ保持設定、保護プロセス一覧 |
-| `event_reader.py` | `win32evtlog` Read-Only 収集、XML パース（`EventData`/`UserData`）、一次スクリーニング、`EventRecordID` 巻き戻り復旧、サービス死活監視、`checkpoint.json` 管理 |
+| `config.py` | `APP_VERSION = "1.30"`、監視対象チャネル/ID（ID `14` 追加）、Flex キュー/503/504クールダウン定数、一次スクリーニング条件、保護プロセス一覧 |
+| `runtime_settings.py` | 原子的 JSON 書込 (`atomic_write_json`)、`RuntimeSettings`（Flex/通常ティア永続管理）、Windows 単一インスタンス Mutex |
+| `ui_host.py` | 専用単一スレッド Tkinter ホスト (`tk.Tk` 1つ＋`Toplevel` キューディスパッチ) |
+| `event_reader.py` | `win32evtlog` Read-Only 収集、XML パース、一次スクリーニング（ID `8/10` フルパス厳格化含む）、`checkpoint.json` 原子的管理 |
 | `allowlist.py` | ホットリロード対応 `allowlist.json` 判定、高リスクイベントバイパス禁止ガード、GUI 登録候補抽出 |
 | `triage_cache.py` | `[CLEAN]` 判定パターンの正規化 SHA-256 フィンガープリント生成・24時間永続キャッシュ（`triage_cache.json`） |
 | `tools.py` | Gemini Function Calling 用 Read-Only ツール（`get_parent_process`, `get_process_network_activity`, `get_process_related_events`）＋ `psutil` 補完 |
@@ -82,7 +85,7 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 | `start_agent.ps1` | UTF-8 (BOM付き) PowerShell ランチャー（UAC 自動昇格、`uv`/`.venv` 確認、`keyring` 安全入力保存、トレイ起動） |
 | `sysmon_config.xml` | 拡張イベント ID (`1, 3, 8, 10, 11, 12, 13, 14, 22`) を低ノイズで収集する Sysmon 設定テンプレート |
 | `CHANGELOG.md` / `README.md` | バージョン履歴（`1.00`〜`1.14`）およびセットアップ・運用ドキュメント |
-| *(Git 管理外)* | `allowlist.json`, `checkpoint.json`, `triage_cache.json`, `alerts/`, `.venv/` |
+| *(Git 管理外)* | `allowlist.json`, `allowlist_candidates.json`, `daily_review_state.json`, `runtime_settings.json`, `checkpoint.json`, `triage_cache.json`, `alerts/`, `.venv/` |
 
 ---
 

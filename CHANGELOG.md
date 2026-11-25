@@ -2,6 +2,34 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.30] - 2026-11-25
+セキュリティ・検知精度・耐障害性の包括的強化、15秒巡回と非同期 Flex トリアージの分離、503/504 多発時の自動クールダウン、および Flex ⇔ 通常 (`standard`) 処理のトレイ／CLI 切替を実装。
+
+### 追加・改善（運用・耐障害性）
+- **503/504 多発時の自動 Flex クールダウン＆通常処理切替 (`agent.py`, `runtime_settings.py`, `tray_app.py`, `main.py`, `start_agent.ps1`, `config.py`)**:
+  - Flex ティアで 503/504/429/タイムアウト等のリトライ超過が連続 `FLEX_CONSECUTIVE_ERROR_THRESHOLD` (2) 回発生すると、自動的に `FLEX_COOLDOWN_SECONDS` (1800秒 = 30分) のクールダウンに入り、その間の通常イベントも即座に `standard` ティアへ退避するように改善。
+  - 503/504/429 時の指数バックオフ初動待機を引き上げ (`CONGESTION_INITIAL_BACKOFF_SECONDS = 5.0` 秒、上限 `MAX_BACKOFF_SECONDS = 60.0` 秒)、オフライン再試行クールダウンも `180` 秒へ拡張。
+  - タスクトレイに「**サービスティア切替 (Flex / 通常)**」サブメニューと現在ティア・待機件数表示を追加し、実行中でも再起動なしで Flex 停止 ⇔ 通常処理固定 (`standard`) を永続切替（`runtime_settings.json`）・クールダウン手動解除可能に。
+  - CLI に `--standard-tier` / `--service-tier`、`start_agent.ps1` に `-StandardTier` および `-SyncDeps`（依存パッケージ同期を初回構築時または明示指定時のみに限定）を追加。
+- **監視ループと Flex キューの分離・バックプレッシャ制御 (`tray_app.py`)**:
+  - 15秒ごとのログ巡回＋`[CRITICAL]` 即時 (`standard`) 処理を担う `_monitoring_worker` と、`[SUSPICIOUS]` イベントを重複排除付き上限キュー（`FlexTriageQueue`, 上限100件）で順次処理する `_flex_triage_worker` に分離し、Flex 待機による監視停止を解消。キュー飽和時はオフライン即時判定へ逃がし、混雑時は自動日次レビューを後回しにする制御を追加。
+- **構造化コンパニオンログ (`events_YYYYMMDD.jsonl`) 出力＆日次レビュー高速化 (`agent.py`, `daily_reviewer.py`, `log_retention.py`)**:
+  - `alerts/incident_YYYYMMDD.md` への追記と同時に `alerts/events_YYYYMMDD.jsonl` を出力し、`DailyReviewer` が JSON Schema (`DAILY_REVIEW_RESPONSE_SCHEMA`) 強制付きで構造化 JSONL を優先解析（過去 `.md` へのフォールバック維持）し、`log_retention.py` の30日・100MBクリーンアップ対象にも統合。
+
+### 修正・セキュリティ強化
+- **プロンプトインジェクション耐性強化 (`agent.py`, `daily_reviewer.py`)**:
+  - イベントログ／日次サマリー入力を `<UNTRUSTED_EVENT_DATA>` / `<UNTRUSTED_LOG_SUMMARY>` タグで隔離・閉じタグエスケープし、システム指示内でデータ内命令の無視を厳命。
+- **検知回避ギャップ修正 (`config.py`, `event_reader.py`, `tools.py`, `keyword_matcher.py`)**:
+  - Sysmon Event ID `14`（Registry Rename）を `config.SYSMON_EVENT_IDS` および `tools.py` の調査 XPath に追加。
+  - `CreateRemoteThread` (ID 8) における別パス同名バイナリ（例: `C:\Temp\explorer.exe` → `C:\Windows\explorer.exe`）や偽 `svchost.exe` の除外バイパスを解消（同一パス・同一PIDのみ除外、`System32` / 正規 Windows Defender パス前方一致を必須化）。
+  - `ProcessAccess` (ID 10) の `"\\windows defender\\"` 部分一致を厳密な正規 Defender ディレクトリ前方一致へ強化。
+  - `keyword_matcher.py` から LOLBAS 悪用可能な `ieframe.dll` / `shdocvw.dll` の安全除外を削除し、`-ec` / `irm` / バッククォート・キャレット難読化（``i`ex``, `^b^y^p^a^s^s`, `w^e^v^t^u^t^i^l` 等）を検出。
+- **ホワイトリストバイパス防止 (`allowlist.py`)**:
+  - `trusted_image_prefixes` における汎用インタプリタの末尾コメント追記（`powershell.exe -c "evil; # C:\Trusted\a.ps1"`）や複数スクリプト混入を遮断するため `all()`＋連結記号・インライン実行拒否へ厳格化し、`trusted_command_line_contains` へのコマンド連結便乗もブロック。
+- **信頼性・UIスレッド安全性・二重起動防止 (`runtime_settings.py`, `ui_host.py`, `process_guard.py`, `daily_reviewer.py`, `event_reader.py`, `agent.py`, `main.py`)**:
+  - 単一インスタンス Windows 名前付きミューテックス (`SingleInstanceMutex`) 導入、全 JSON 設定/状態保存の原子的置換 (`atomic_write_json`) 統一。
+  - 専用単一 UI スレッド (`ui_host.py`) を新設し、`CRITICAL` 迎撃パネルとホワイトリスト確認 UI の `tk.Toplevel` 一元生成化、スレッド間競合解消（`_state_lock` / `_report_lock` 導入と実使用モデル・ティアの明示返却）、および `[CLEAN]` 時の不要な `psutil` プロセス照合スキップ＆15秒以内 PID 再利用対策（`expected_command_line` 照合）を実施。
+
 ## [1.20] - 2026-11-25
 公開リポジトリ向けセキュリティ・プライバシー監査に基づくバグ修正、機微情報マスキング、システム改善、および恒久テストスイート (`tests/`) の整備を実施。
 

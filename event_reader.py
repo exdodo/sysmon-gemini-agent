@@ -16,6 +16,7 @@ import logging
 import os
 from pathlib import Path
 import re
+import threading
 import time
 from typing import Any
 import xml.etree.ElementTree as ET
@@ -23,6 +24,7 @@ import xml.etree.ElementTree as ET
 import allowlist
 import config
 import keyword_matcher
+from runtime_settings import atomic_write_json
 from sanitizer import redact_sensitive_text
 
 logger = logging.getLogger("sysmon_gemini_agent.event_reader")
@@ -461,18 +463,44 @@ def _image_basename(path: str) -> str:
     return (path or "").replace("/", "\\").rsplit("\\", 1)[-1].lower()
 
 
+def _norm_win_path_simple(path: str) -> str:
+    return (path or "").strip().replace("/", "\\").lower()
+
+
+def _is_trusted_defender_path(path_norm: str, base_name: str) -> bool:
+    return base_name in ("msmpeng.exe", "nissrv.exe") and path_norm.startswith(
+        (
+            "c:\\programdata\\microsoft\\windows defender\\",
+            "c:\\program files\\windows defender\\",
+        )
+    )
+
+
 def _screen_create_remote_thread(event: NormalizedEvent, reasons: list[str]) -> None:
     """Sysmon Event ID 8 (CreateRemoteThread) のスレッド注入判定を行います。"""
     tgt_img = event.event_details.get("target_image", "")
     src_base = _image_basename(event.image)
     tgt_base = _image_basename(tgt_img)
     start_mod = (event.event_details.get("start_module") or "").strip().lower()
-    src_lower = (event.image or "").lower()
+    src_norm = _norm_win_path_simple(event.image)
+    tgt_norm = _norm_win_path_simple(tgt_img)
+    tgt_pid_raw = str(event.event_details.get("target_pid") or "").strip()
 
-    if src_base and src_base == tgt_base:
+    # 同一パスかつ同一PIDの自プロセス内スレッド作成のみ除外（別パス同名プロセス偽装は除外しない）
+    if (
+        src_norm
+        and src_norm == tgt_norm
+        and tgt_pid_raw
+        and event.process_id is not None
+        and str(event.process_id) == tgt_pid_raw
+    ):
         return
 
-    is_trusted_src = src_base in config.TRUSTED_SYSTEM_INJECTOR_NAMES
+    is_trusted_system = (
+        src_base in ("csrss.exe", "smss.exe", "wininit.exe", "services.exe", "svchost.exe")
+        and src_norm.startswith("c:\\windows\\system32\\")
+    )
+    is_trusted_src = is_trusted_system or _is_trusted_defender_path(src_norm, src_base)
     if is_trusted_src and start_mod and tgt_base != "lsass.exe":
         return
 
@@ -486,7 +514,7 @@ def _screen_create_remote_thread(event: NormalizedEvent, reasons: list[str]) -> 
     elif (
         tgt_base in config.HIGH_RISK_TARGET_PROCESSES
         or src_base in config.DROPPER_SOURCE_IMAGES
-        or any(tp.lower() in src_lower for tp in config.SUSPICIOUS_TEMP_PATHS)
+        or any(tp.lower() in src_norm for tp in config.SUSPICIOUS_TEMP_PATHS)
     ):
         reasons.append(
             f"[CRITICAL候補] 他プロセスへのスレッド注入 (CreateRemoteThread: {event.image} -> {tgt_img})"
@@ -498,7 +526,8 @@ def _screen_process_access(event: NormalizedEvent, reasons: list[str]) -> None:
     tgt_img = event.event_details.get("target_image", "")
     src_base = _image_basename(event.image)
     tgt_base = _image_basename(tgt_img)
-    src_lower = (event.image or "").lower()
+    src_norm = _norm_win_path_simple(event.image)
+    tgt_norm = _norm_win_path_simple(tgt_img)
     granted_str = event.event_details.get("granted_access", "")
     granted_mask = _parse_int(granted_str) or 0
     call_trace_lower = (event.event_details.get("call_trace") or "").lower()
@@ -514,11 +543,9 @@ def _screen_process_access(event: NormalizedEvent, reasons: list[str]) -> None:
     if tgt_base == "lsass.exe" and (has_vm_read or has_vm_write_or_op):
         is_trusted_core = (
             src_base in ("csrss.exe", "wininit.exe", "smss.exe", "services.exe", "lsass.exe", "svchost.exe")
-            and src_lower.startswith("c:\\windows\\system32\\")
+            and src_norm.startswith("c:\\windows\\system32\\")
         )
-        is_trusted_defender = (
-            src_base in ("msmpeng.exe", "nissrv.exe") and "\\windows defender\\" in src_lower
-        )
+        is_trusted_defender = _is_trusted_defender_path(src_norm, src_base)
         if (not is_trusted_core and not is_trusted_defender) or has_unbacked_calltrace:
             reasons.append(
                 f"[CRITICAL候補] LSASS プロセスメモリへの高権限アクセス (認証情報ダンプ疑い: "
@@ -526,11 +553,11 @@ def _screen_process_access(event: NormalizedEvent, reasons: list[str]) -> None:
             )
     elif (
         has_vm_write_or_op
-        and src_base != tgt_base
+        and src_norm != tgt_norm
         and tgt_base in config.HIGH_RISK_TARGET_PROCESSES
         and (
             src_base in config.DROPPER_SOURCE_IMAGES
-            or any(tp.lower() in src_lower for tp in config.SUSPICIOUS_TEMP_PATHS)
+            or any(tp.lower() in src_norm for tp in config.SUSPICIOUS_TEMP_PATHS)
             or has_unbacked_calltrace
         )
     ):
@@ -899,6 +926,7 @@ class CheckpointManager:
 
     def __init__(self, checkpoint_path: Path = config.CHECKPOINT_FILE) -> None:
         self.checkpoint_path: Path = checkpoint_path
+        self._lock = threading.Lock()
         self._checkpoints: dict[str, int] = self.load()
 
     def load(self) -> dict[str, int]:
@@ -922,49 +950,52 @@ class CheckpointManager:
 
     def get_last_record_id(self, channel: str) -> int:
         """指定チャネルの最終処理済み EventRecordID を返します（未記録時は 0）。"""
-        return self._checkpoints.get(channel, 0)
+        with self._lock:
+            return self._checkpoints.get(channel, 0)
 
     def update(self, channel: str, record_id: int, persist: bool = True) -> None:
         """
         指定チャネルの EventRecordID を単調増加（現在の値より大きい場合のみ）で更新し、
         checkpoint.json へ記録します。
         """
-        current = self._checkpoints.get(channel, 0)
-        if record_id > current:
-            self._checkpoints[channel] = record_id
-            if persist:
-                self.save()
+        with self._lock:
+            current = self._checkpoints.get(channel, 0)
+            changed = record_id > current
+            if changed:
+                self._checkpoints[channel] = record_id
+        if changed and persist:
+            self.save()
 
     def reset_channel(self, channel: str, new_record_id: int = 0) -> None:
         """
         ログ消去等による EventRecordID 巻き戻りを検知した際、ファイルを削除せず
         該当チャネルのチェックポイントのみ安全にリセットして監視を復旧します。
         """
-        self._checkpoints[channel] = max(0, int(new_record_id))
+        with self._lock:
+            self._checkpoints[channel] = max(0, int(new_record_id))
         self.save(skip_merge_channels={channel})
 
     def save(self, skip_merge_channels: set[str] | None = None) -> None:
-        """現在のチェックポイント辞書を checkpoint.json に保存します。"""
+        """現在のチェックポイント辞書を checkpoint.json に原子的に保存します。"""
         skip_set = skip_merge_channels or set()
-        try:
-            # 既存ファイルがある場合はマージして単調増加を保証 (リセット指定チャネルは除外)
-            if self.checkpoint_path.exists():
-                try:
-                    existing = json.loads(self.checkpoint_path.read_text(encoding="utf-8") or "{}")
-                    if isinstance(existing, dict):
-                        for ch, rid in existing.items():
-                            if ch in skip_set:
-                                continue
-                            if isinstance(rid, int) and rid > self._checkpoints.get(ch, 0):
-                                self._checkpoints[ch] = rid
-                except (OSError, ValueError, json.JSONDecodeError):
-                    pass
+        with self._lock:
+            try:
+                # 既存ファイルがある場合はマージして単調増加を保証 (リセット指定チャネルは除外)
+                if self.checkpoint_path.exists():
+                    try:
+                        existing = json.loads(self.checkpoint_path.read_text(encoding="utf-8") or "{}")
+                        if isinstance(existing, dict):
+                            for ch, rid in existing.items():
+                                if ch in skip_set:
+                                    continue
+                                if isinstance(rid, int) and rid > self._checkpoints.get(ch, 0):
+                                    self._checkpoints[ch] = rid
+                    except (OSError, ValueError, json.JSONDecodeError):
+                        pass
 
-            serialized = json.dumps(self._checkpoints, indent=2, ensure_ascii=False)
-            with open(self.checkpoint_path, mode="w", encoding="utf-8") as fp:
-                fp.write(serialized + "\n")
-        except OSError as exc:
-            logger.error("checkpoint.json の保存に失敗しました: %s", exc)
+                atomic_write_json(self.checkpoint_path, dict(self._checkpoints))
+            except OSError as exc:
+                logger.error("checkpoint.json の保存に失敗しました: %s", exc)
 
 
 class WindowsEventReader:

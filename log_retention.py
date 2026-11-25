@@ -22,15 +22,18 @@ import config
 
 logger = logging.getLogger("sysmon_gemini_agent.log_retention")
 
-_INCIDENT_FILE_RE = re.compile(r"^(?:incident|daily_review)_(\d{8})\.md$")
+_INCIDENT_FILE_RE = re.compile(
+    r"^(?:(?:incident|daily_review)_(\d{8})\.md|events_(\d{8})\.jsonl)$"
+)
 
 
 def _parse_incident_date(filename: str) -> date | None:
     match = _INCIDENT_FILE_RE.match(filename)
     if not match:
         return None
+    date_part = match.group(1) or match.group(2)
     try:
-        return datetime.strptime(match.group(1), "%Y%m%d").date()
+        return datetime.strptime(date_part, "%Y%m%d").date()
     except ValueError:
         return None
 

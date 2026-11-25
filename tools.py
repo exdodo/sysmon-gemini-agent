@@ -261,7 +261,7 @@ def get_process_network_activity(process_id: int) -> list[dict]:
 def get_process_related_events(process_id: int) -> list[dict]:
     """指定されたプロセスID (ProcessId / SourceProcessId / TargetProcessId) に関連する
     スレッド注入 (ID 8)、プロセスメモリアクセス (ID 10)、ファイル作成 (ID 11)、
-    レジストリ変更 (ID 12/13)、DNSクエリ (ID 22) の履歴を取得します。
+    レジストリ変更 (ID 12/13/14)、DNSクエリ (ID 22) の履歴を取得します。
 
     一連の攻撃チェーン（ファイル投下→レジストリ永続化→インジェクション/LSASSアクセス）を
     相関分析するために使用する完全読み取り専用ツールです。
@@ -294,7 +294,7 @@ def get_process_related_events(process_id: int) -> list[dict]:
             matched_records[ev.event_record_id] = ev.to_trimmed_dict()
 
     xpath = (
-        "*[System[(EventID=8 or EventID=10 or EventID=11 or EventID=12 or EventID=13 or EventID=22)] and "
+        "*[System[(EventID=8 or EventID=10 or EventID=11 or EventID=12 or EventID=13 or EventID=14 or EventID=22)] and "
         f"EventData[(Data[@Name='ProcessId']='{target_pid}' or "
         f"Data[@Name='SourceProcessId']='{target_pid}' or "
         f"Data[@Name='TargetProcessId']='{target_pid}')]]"

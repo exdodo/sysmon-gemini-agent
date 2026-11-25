@@ -13,7 +13,7 @@ from pathlib import Path
 # ============================================================================
 # アプリケーションバージョン定義 (機能追加時に更新し、CHANGELOG.md / Gitタグと同期)
 # ============================================================================
-APP_VERSION: str = "1.20"
+APP_VERSION: str = "1.30"
 
 # ============================================================================
 # パス設定 (ワークスペース内に閉じた設計・親ディレクトリへのアクセス禁止)
@@ -26,6 +26,10 @@ ALLOWLIST_FILE: Path = BASE_DIR / "allowlist.json"
 ALLOWLIST_CANDIDATES_FILE: Path = BASE_DIR / "allowlist_candidates.json"
 DAILY_REVIEW_STATE_FILE: Path = BASE_DIR / "daily_review_state.json"
 TRIAGE_CACHE_FILE: Path = BASE_DIR / "triage_cache.json"
+RUNTIME_SETTINGS_FILE: Path = BASE_DIR / "runtime_settings.json"
+
+# 多重起動防止用 Windows 名前付きミューテックス名
+SINGLE_INSTANCE_MUTEX_NAME: str = "Local\\SysmonGeminiAgent_Singleton_Mutex"
 
 # 日次ログレビュー（前日分の総合判断＆ホワイトリスト候補抽出）の実行時刻 (時)
 DAILY_REVIEW_HOUR: int = 9
@@ -67,6 +71,7 @@ SYSMON_EVENT_IDS: set[int] = {
     11,   # FileCreate (スタートアップ・不審フォルダへの実行ファイル/スクリプト生成検知)
     12,   # RegistryEvent (Object create/delete: 永続化・セキュリティ設定変更)
     13,   # RegistryEvent (Value Set: 永続化・IFEO・Defender無効化等の値書換)
+    14,   # RegistryEvent (Key and Value Rename: レジストリキー/値リネームによる回避検知)
     16,   # Sysmon Config State Changed (Sysmon設定変更・改ざん検知)
     22,   # DNSEvent (DNSクエリ・C2/LOLBin名前解決・DNSトンネリング検知)
     255,  # Sysmon Error (Sysmonドライバ・エラー報告)
@@ -354,14 +359,21 @@ FLEX_HTTP_TIMEOUT_MS: int = 300_000        # Flex ティア向け待機許容タ
 STANDARD_HTTP_TIMEOUT_MS: int = 60_000     # 標準ティア向けタイムアウト (60,000 ms = 1分)
 FLEX_FALLBACK_TO_STANDARD: bool = True     # Flex リトライ上限到達時に standard へ自動切替
 
-# API レート制限 (429 / 503 / ResourceExhausted) および通信障害時の Exponential Backoff 設定
+# Flex キュー制御 & 503/504 混雑時サーキットブレーカー設定
+FLEX_QUEUE_MAX_SIZE: int = 100
+FLEX_DAILY_REVIEW_DEFER_THRESHOLD: int = 10
+FLEX_CONSECUTIVE_ERROR_THRESHOLD: int = 2
+FLEX_COOLDOWN_SECONDS: int = int(os.environ.get("FLEX_COOLDOWN_SECONDS", "1800") or "1800")
+
+# API レート制限 (429 / 503 / 504 / ResourceExhausted) および通信障害時の Exponential Backoff 設定
 MAX_API_RETRIES: int = 4
 INITIAL_BACKOFF_SECONDS: float = 2.0
+CONGESTION_INITIAL_BACKOFF_SECONDS: float = 5.0
 BACKOFF_MULTIPLIER: float = 2.0
-MAX_BACKOFF_SECONDS: float = 30.0
+MAX_BACKOFF_SECONDS: float = 60.0
 
 # オフライン・API障害時に連続リトライ遅延を防ぐサーキットブレーカー再試行クールダウン（秒）
-API_OFFLINE_COOLDOWN_SECONDS: int = 60
+API_OFFLINE_COOLDOWN_SECONDS: int = 180
 
 # ============================================================================
 # 第3層: トリアージ評価レベル定義

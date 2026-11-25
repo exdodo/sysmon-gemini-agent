@@ -30,6 +30,7 @@ from typing import Any
 import allowlist
 import config
 from event_reader import NormalizedEvent
+from ui_host import dispatch_to_ui
 
 logger = logging.getLogger("sysmon_gemini_agent.process_guard")
 
@@ -99,14 +100,20 @@ def _parse_event_utc_timestamp(utc_str: str) -> float | None:
     return None
 
 
+def _normalize_cmdline_for_compare(cmdline: str) -> str:
+    cleaned = (cmdline or "").replace('"', "").replace("'", "").replace("/", "\\").strip()
+    return re.sub(r"\s+", " ", cleaned).lower()
+
+
 def verify_target_process(
     pid: int | None,
     expected_image: str,
     event_utc_time: str = "",
+    expected_command_line: str = "",
 ) -> ProcessVerificationResult:
     """
     指定された PID が現在も生存しており、かつイベント発生時のプロセスと同一であるかを
-    「PID + 実行ファイル名 + 起動時刻」の3点で厳密に照合します。
+    「PID + 実行ファイル名 + 起動時刻（+ 汎用インタプリタ時はコマンドライン）」で厳密に照合します。
     """
     if not pid or pid <= 4:
         return ProcessVerificationResult(
@@ -159,6 +166,10 @@ def verify_target_process(
         create_utc_str = datetime.fromtimestamp(create_ts, tz=timezone.utc).strftime(
             "%Y-%m-%d %H:%M:%S.%f"
         )[:-3]
+        try:
+            proc_cmdline_list = proc.cmdline() or []
+        except (psutil.AccessDenied, psutil.ZombieProcess, OSError):
+            proc_cmdline_list = []
 
     except (psutil.NoSuchProcess, psutil.ZombieProcess):
         return ProcessVerificationResult(
@@ -216,6 +227,55 @@ def verify_target_process(
                     f"イベント発生時刻 ({event_utc_time}) より新しいため、再起動された別プロセスと判定しました。"
                 ),
             )
+
+    # 2.5. 汎用インタプリタ起動時の15秒以内PID再利用誤爆対策 (コマンドライン照合)
+    if (
+        expected_command_line
+        and actual_basename in allowlist.GENERIC_INTERPRETER_BASENAMES
+        and proc_cmdline_list
+    ):
+        actual_cmd_norm = _normalize_cmdline_for_compare(" ".join(proc_cmdline_list))
+        expected_cmd_norm = _normalize_cmdline_for_compare(expected_command_line)
+        exp_scripts = {
+            m.group(1).strip().replace("/", "\\").lower()
+            for m in allowlist._SCRIPT_PATH_RE.finditer(expected_command_line)
+        }
+        act_scripts = {
+            m.group(1).strip().replace("/", "\\").lower()
+            for m in allowlist._SCRIPT_PATH_RE.finditer(" ".join(proc_cmdline_list))
+        }
+        if exp_scripts and act_scripts and exp_scripts.isdisjoint(act_scripts):
+            return ProcessVerificationResult(
+                pid=pid,
+                is_alive=True,
+                is_verified_same_process=False,
+                is_protected=True,
+                process_name=proc_name,
+                exe_path=proc_exe,
+                create_time_utc=create_utc_str,
+                status=proc_status,
+                reason=(
+                    f"【誤爆防止】PID {pid} ({proc_name}) の実行中スクリプトがイベント記録時と異なるため、"
+                    "PID再利用による別プロセスと判定しました。"
+                ),
+            )
+        if not exp_scripts and not act_scripts and len(proc_cmdline_list) > 1:
+            actual_args = _normalize_cmdline_for_compare(" ".join(proc_cmdline_list[1:]))
+            if actual_args and actual_args not in expected_cmd_norm:
+                return ProcessVerificationResult(
+                    pid=pid,
+                    is_alive=True,
+                    is_verified_same_process=False,
+                    is_protected=True,
+                    process_name=proc_name,
+                    exe_path=proc_exe,
+                    create_time_utc=create_utc_str,
+                    status=proc_status,
+                    reason=(
+                        f"【誤爆防止】PID {pid} ({proc_name}) のコマンドライン引数がイベント記録時と一致しないため、"
+                        "PID再利用による別プロセスと判定しました。"
+                    ),
+                )
 
     # 3. OS中枢プロセス・開発ツールの保護リスト照合
     if actual_basename in config.PROTECTED_PROCESS_NAMES:
@@ -445,12 +505,18 @@ def execute_process_action(
     expected_image: str,
     event_utc_time: str,
     report_file: str = "",
+    expected_command_line: str = "",
 ) -> tuple[bool, str]:
     """
     ボタン押下時に再度「PID + 実行ファイル名 + 起動時刻」を厳密照合した上で、
     指定されたアクション ('suspend' / 'resume' / 'kill') を実行します。
     """
-    verification = verify_target_process(pid, expected_image, event_utc_time)
+    verification = verify_target_process(
+        pid,
+        expected_image,
+        event_utc_time,
+        expected_command_line=expected_command_line,
+    )
     if not verification.is_alive:
         return False, verification.reason
     if not verification.is_verified_same_process:
@@ -492,35 +558,84 @@ def show_critical_response_dialog(
 ) -> None:
     """
     [CRITICAL] 検知時に Microsoft Defender への緊急スキャン通報を非同期で開始するとともに、
-    最前面の緊急対応ウィンドウ（ワンクリック迎撃パネル）を別スレッドで表示します。
+    単一 Tkinter UI スレッド上に最前面の緊急対応ウィンドウ（ワンクリック迎撃パネル）を表示します。
     """
-    thread = threading.Thread(
-        target=_run_dialog_window,
-        args=(event, report_text, report_file, auto_defender_scan),
-        name=f"CriticalDialog-PID-{event.process_id}",
-        daemon=True,
+    ok = dispatch_to_ui(
+        lambda parent_root: _build_critical_dialog_window(
+            parent_root, event, report_text, report_file, auto_defender_scan
+        )
     )
-    thread.start()
+    if not ok:
+        logger.warning("UI ホスト経由の緊急迎撃パネル表示をフォールバック実行します。")
+        thread = threading.Thread(
+            target=_run_standalone_dialog_window,
+            args=(event, report_text, report_file, auto_defender_scan),
+            name=f"CriticalDialog-PID-{event.process_id}",
+            daemon=True,
+        )
+        thread.start()
 
 
-def _run_dialog_window(
+def _run_standalone_dialog_window(
     event: NormalizedEvent,
     report_text: str,
     report_file: str,
     auto_defender_scan: bool = True,
 ) -> None:
-    """Tkinter によるワンクリック迎撃ダイアログのメイン処理。"""
+    """UI ホスト利用不可時のスタンドアロン Tkinter ダイアログ起動フォールバック。"""
     try:
         root = tk.Tk()
+        root.withdraw()
+        win = _build_critical_dialog_window(
+            root,
+            event,
+            report_text,
+            report_file,
+            auto_defender_scan,
+            on_close=root.destroy,
+        )
+        if win is not None:
+            win.protocol("WM_DELETE_WINDOW", root.destroy)
+            root.mainloop()
+    except Exception as gui_exc:
+        logger.error("緊急迎撃ダイアログの表示中にエラーが発生しました: %s", gui_exc)
+
+
+def _build_critical_dialog_window(
+    parent_root: tk.Misc,
+    event: NormalizedEvent,
+    report_text: str,
+    report_file: str,
+    auto_defender_scan: bool = True,
+    on_close: Callable[[], None] | None = None,
+) -> tk.Toplevel | None:
+    """Tkinter (`Toplevel`) によるワンクリック迎撃ダイアログを構築して表示します。"""
+    try:
+        root = tk.Toplevel(parent_root)
         root.title("【緊急】Sysmon Gemini 監視エージェント - CRITICAL 迎撃パネル")
         root.geometry("780x620")
         root.configure(bg="#1E1E2E")
         root.attributes("-topmost", True)
+        expected_cmd = event.command_line if event.event_id == 1 else ""
+
+        def _close_win() -> None:
+            try:
+                root.destroy()
+            except Exception:
+                pass
+            if on_close is not None:
+                try:
+                    on_close()
+                except Exception:
+                    pass
+
+        root.protocol("WM_DELETE_WINDOW", _close_win)
 
         verification = verify_target_process(
             event.process_id,
             event.image,
             event.utc_time,
+            expected_command_line=expected_cmd,
         )
 
         # ヘッダー（赤色警告バー）
@@ -597,10 +712,11 @@ def _run_dialog_window(
 
         def _update_defender_ui(summary_text: str) -> None:
             try:
-                root.after(
-                    0,
-                    lambda: defender_var.set(f"🛡️ Microsoft Defender 検査結果: {summary_text}"),
-                )
+                if root.winfo_exists():
+                    root.after(
+                        0,
+                        lambda: defender_var.set(f"🛡️ Microsoft Defender 検査結果: {summary_text}"),
+                    )
             except Exception:
                 pass
 
@@ -643,6 +759,7 @@ def _run_dialog_window(
                 event.image,
                 event.utc_time,
                 report_file,
+                expected_command_line=expected_cmd,
             )
             status_var.set(f"ステータス: {msg}")
             if ok:
@@ -659,6 +776,7 @@ def _run_dialog_window(
                 event.image,
                 event.utc_time,
                 report_file,
+                expected_command_line=expected_cmd,
             )
             status_var.set(f"ステータス: {msg}")
             if ok:
@@ -682,6 +800,7 @@ def _run_dialog_window(
                 event.image,
                 event.utc_time,
                 report_file,
+                expected_command_line=expected_cmd,
             )
             status_var.set(f"ステータス: {msg}")
             if ok:
@@ -822,7 +941,7 @@ def _run_dialog_window(
         btn_close = tk.Button(
             btn_frame,
             text="閉じる",
-            command=root.destroy,
+            command=_close_win,
             bg="#4B5563",
             fg="#F9FAFB",
             font=("Yu Gothic UI", 9),
@@ -830,7 +949,7 @@ def _run_dialog_window(
             pady=6,
         )
         btn_close.pack(side=tk.RIGHT)
-
-        root.mainloop()
+        return root
     except Exception as gui_exc:
-        logger.error("緊急迎撃ダイアログの表示中にエラーが発生しました: %s", gui_exc)
+        logger.error("緊急迎撃ダイアログの構築中にエラーが発生しました: %s", gui_exc)
+        return None

@@ -1,6 +1,6 @@
 # Windows Event Log & Sysmon 監視エージェント (Google Gemini版)
 
-> **Version**: `1.20`（変更履歴は [CHANGELOG.md](file:///./CHANGELOG.md) を参照）
+> **Version**: `1.30`（変更履歴は [CHANGELOG.md](file:///./CHANGELOG.md) を参照）
 
 Windowsイベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`, `System`）を定期巡回し、**ルールベースの一次スクリーニング**と **Google Gemini (`google-genai` SDK) の自律調査ループ（Function Calling）**、および **オフライン・API障害時のローカル即時フォールバック判定** を組み合わせて、不審なプロセス・インジェクション・永続化・外部通信の兆候を安全かつ低コストにトリアージする監視エージェントです。
 
@@ -95,6 +95,12 @@ powershell -ExecutionPolicy Bypass -File .\start_agent.ps1 -Mode TraySilent
 
 # 1サイクルのみ動作確認する場合
 powershell -ExecutionPolicy Bypass -File .\start_agent.ps1 -Mode Once
+
+# Flex ティアの 503/504 を避けて最初から通常処理 (standard) 固定で起動する場合
+powershell -ExecutionPolicy Bypass -File .\start_agent.ps1 -StandardTier
+
+# 依存パッケージ (requirements.txt) を明示的に再同期して起動する場合
+powershell -ExecutionPolicy Bypass -File .\start_agent.ps1 -SyncDeps
 ```
 
 ---
@@ -142,11 +148,15 @@ cd C:\path\to\sysmon-gemini-agent
 .\.venv\Scripts\python.exe main.py --tray
 ```
 
-#### オフラインルール監視モード（APIキー不要・Gemini API不使用: `--offline`）
+#### オフラインルール監視 / 通常ティア固定モード
 ```powershell
+# 完全オフラインルール監視（API不使用）
 .\.venv\Scripts\python.exe main.py --tray --offline
+
+# Flex ティアを使用せず通常ティア (standard) のみで実行（503/504回避）
+.\.venv\Scripts\python.exe main.py --tray --standard-tier
 ```
-（※ 通常起動時でも、実行中にネットワーク断や Gemini API 障害が発生すると自動でローカルルール判定へフォールバックします）
+（※ 通常起動時でも、Flex ティアで 503/504 等が連続すると自動的に30分間通常ティアへ退避します。タスクトレイメニュー「サービスティア切替 (Flex / 通常)」からいつでも手動切替・永続化も可能です）
 （黒いコンソールウィンドウを出さずにバックグラウンド常駐させたい場合は `.\.venv\Scripts\pythonw.exe main.py --tray` を使用できます）
 
 - **タスクバーアイコンの色変化**:
