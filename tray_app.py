@@ -717,6 +717,14 @@ class SysmonTrayApp:
                 offline_only=self.offline_only,
                 service_tier_override=self.service_tier_override,
             )
+            logger.info(
+                "Windows Event Log & Sysmon 監視エージェント (トレイ常駐) v%s 起動 | モデル=%s | ティア=%s | 巡回間隔=%d秒 | オフライン専用=%s",
+                config.APP_VERSION,
+                self.triage_agent.model_name,
+                self.triage_agent.get_tier_status_label(),
+                self.poll_interval,
+                self.offline_only,
+            )
             self._agent_ready_event.set()
             if self.current_state != STATE_CRITICAL:
                 mode_label = "オフラインルール監視" if self.offline_only else self.triage_agent.model_name

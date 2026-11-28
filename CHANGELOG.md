@@ -2,6 +2,16 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.34] - 2026-11-28
+運用アラートフォルダ (`alerts/`) の精査で見つかった 5 件のバグ・品質課題を修正。
+
+### 修正・改善
+- **`allowlist.py`**: `cmd.exe /c "<trusted>.cmd"` のような正規 `.cmd`/`.bat` ラッパー起動まで `/c` 一律判定でブロックしていたバグを修正（コマンド連結記号・`-enc`・別バイナリ便乗は引き続き厳格に遮断）。
+- **`daily_reviewer.py`**: `parse_events_jsonl()` / `parse_incident_report()` で `channel`・`event_id`・`event_record_id`・`offline_fallback` を引き継ぎ、`reconcile_offline_duplicates()` によりオフライン暫定判定とオンライン再判定の二重集計を解消。また複数バッククォート囲みフィールドの抽出にも対応。
+- **`event_reader.py` / `config.py`**: 長大なコマンドラインをプロンプト投入前に中央省略（`MAX_TRIMMED_CMDLINE_CHARS = 2000`）するよう変更し、Sysmon Event ID `3` のコマンドライン・親プロセス欠落時は `_RECENT_EVENTS` キャッシュ上の直近 ID `1`/`4688`（同一 PID・同一実行イメージ名・起動時刻整合）から優先補完するように強化。
+- **`agent.py`**: Markdown レポートのコマンドライン等の改行・バッククォートを安全に1行インラインコード整形 (`_format_md_inline_code`) し、非ネットワークイベントの通信先表示を `:None` から `なし` へ改善。
+- **`tray_app.py`**: トレイ常駐起動時にバージョン・実使用モデル・ティア方針を `agent_runtime.log` へ明示記録するように改善。
+
 ## [1.33] - 2026-11-28
 `httpx2` タイムアウト／トランスポート例外の指数バックオフリトライ＆通常ティアフォールバック漏れと、`EvtNext` 一括取得時の RPC `1734 (array bounds invalid)` によるイベント滞留を修正。
 

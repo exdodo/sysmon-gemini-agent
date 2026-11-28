@@ -63,6 +63,21 @@ except ImportError:
     HAS_PYWIN32 = False
 
 
+def _truncate_text_middle(
+    text: str,
+    max_chars: int = config.MAX_TRIMMED_CMDLINE_CHARS,
+) -> str:
+    """長大なコマンドラインの先頭と末尾を残して中央を省略し、API トークン肥大化を防ぎます。"""
+    if not text or max_chars <= 0 or len(text) <= max_chars:
+        return text
+    omitted = len(text) - max_chars
+    marker = f"\n...[省略: {omitted}文字]...\n"
+    keep = max(40, max_chars - len(marker))
+    head_len = max(20, int(keep * 0.6))
+    tail_len = max(20, keep - head_len)
+    return f"{text[:head_len]}{marker}{text[-tail_len:]}"
+
+
 @dataclass(slots=True)
 class NormalizedEvent:
     """
@@ -98,9 +113,9 @@ class NormalizedEvent:
             "UtcTime": self.utc_time,
             "ProcessId": self.process_id,
             "Image": self.image,
-            "CommandLine": redact_sensitive_text(self.command_line),
+            "CommandLine": _truncate_text_middle(redact_sensitive_text(self.command_line)),
             "ParentProcessId": self.parent_process_id,
-            "ParentCommandLine": redact_sensitive_text(self.parent_command_line),
+            "ParentCommandLine": _truncate_text_middle(redact_sensitive_text(self.parent_command_line)),
             "DestinationIp": self.destination_ip,
             "DestinationPort": self.destination_port,
         }
@@ -719,19 +734,53 @@ def _find_temp_payload_in_command_line(cmd_lower: str) -> str | None:
     return None
 
 
+def _normalize_utc_comparable(ts: str) -> str:
+    """時刻文字列 ('YYYY-MM-DD HH:MM:SS...' / 'YYYY-MM-DDTHH:MM:SS...Z') を比較可能な形に正規化します。"""
+    norm = (ts or "").strip().replace("T", " ").rstrip("Z")
+    if len(norm) >= 19 and norm[4:5] == "-" and norm[7:8] == "-":
+        return norm[:19]
+    return ""
+
+
 def _enrich_live_command_line_if_empty(event: NormalizedEvent) -> None:
     """
-    Sysmon Event ID 3 等で CommandLine が欠落している場合、対象プロセスがまだ稼働中であれば
-    psutil を用いて読み取り専用で実際のコマンドラインと親PIDを補完します。
+    Sysmon Event ID 3 等で CommandLine や親プロセス情報が欠落している場合、
+    まず直近イベントキャッシュ (`_RECENT_EVENTS`) の同一 PID プロセス作成イベント (ID 1 / 4688) から補完し、
+    見つからない場合のみ稼働中プロセスへ `psutil` で読み取り専用照会して補完します。
     """
     if event.command_line or not event.process_id or event.process_id <= 4:
         return
+
+    expected_base = _image_basename(event.image)
+    ev_time_cmp = _normalize_utc_comparable(event.utc_time)
+
+    # 1. 直近イベントキャッシュから同一 PID・同一実行ファイル名・起動時刻 <= イベント時刻の ID 1/4688 を検索
+    for cached_ev in get_cached_events():
+        if cached_ev.event_id not in (1, 4688) or cached_ev.process_id != event.process_id:
+            continue
+        cached_base = _image_basename(cached_ev.image)
+        if expected_base and cached_base and expected_base != cached_base:
+            continue
+        cached_time_cmp = _normalize_utc_comparable(cached_ev.utc_time)
+        if ev_time_cmp and cached_time_cmp and cached_time_cmp > ev_time_cmp:
+            continue
+        if cached_ev.command_line:
+            event.command_line = cached_ev.command_line
+        if event.parent_process_id is None and cached_ev.parent_process_id is not None:
+            event.parent_process_id = cached_ev.parent_process_id
+        if not event.parent_image and cached_ev.parent_image:
+            event.parent_image = cached_ev.parent_image
+        if not event.parent_command_line and cached_ev.parent_command_line:
+            event.parent_command_line = cached_ev.parent_command_line
+        if event.command_line:
+            return
+
     if not HAS_PSUTIL or psutil is None:
         return
 
+    # 2. キャッシュで見つからない場合は稼働中プロセスから読み取り専用取得
     try:
         proc = psutil.Process(event.process_id)
-        expected_base = _image_basename(event.image)
         actual_name = (proc.name() or "").lower()
         if expected_base and expected_base != actual_name:
             return

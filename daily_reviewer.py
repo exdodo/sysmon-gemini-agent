@@ -343,10 +343,10 @@ class AllowlistCandidateStore:
 
 def _extract_backtick_field(block: str, label_prefix: str) -> str:
     m = re.search(
-        rf"-\s+\*\*{re.escape(label_prefix)}[^*]*\*\*:\s*`([^`]*)`",
+        rf"-\s+\*\*{re.escape(label_prefix)}[^*]*\*\*:\s*(`+)(.*?)\1(?=\s*(?:\(|$|\r|\n))",
         block,
     )
-    return m.group(1).strip() if m else ""
+    return m.group(2).strip() if m else ""
 
 
 def parse_incident_report(incident_path: Path) -> list[dict[str, Any]]:
@@ -367,9 +367,25 @@ def parse_incident_report(incident_path: Path) -> list[dict[str, Any]]:
         severity = f"[{m_head.group(1)}]"
         timestamp = m_head.group(2).strip()
         channel_line = ""
+        channel_name = ""
+        event_id = 0
+        event_record_id = 0
         m_ch = re.search(r"-\s+\*\*監視チャネル\*\*:\s*(.+)", block)
         if m_ch:
             channel_line = m_ch.group(1).strip()
+            m_ch_detail = re.search(
+                r"`([^`]+)`\s*\(Event ID:\s*`(\d+)`,\s*Record ID:\s*`(\d+)`\)",
+                channel_line,
+            )
+            if m_ch_detail:
+                channel_name = m_ch_detail.group(1).strip()
+                event_id = int(m_ch_detail.group(2))
+                event_record_id = int(m_ch_detail.group(3))
+
+        is_offline_fallback = (
+            "offline-rule-fallback" in block
+            or "Gemini API 障害時ローカルフォールバック" in block
+        )
         image = _extract_backtick_field(block, "対象プロセス")
         command_line = _extract_backtick_field(block, "コマンドライン")
         parent_command_line = _extract_backtick_field(block, "親プロセス")
@@ -398,6 +414,10 @@ def parse_incident_report(incident_path: Path) -> list[dict[str, Any]]:
                 "severity": severity,
                 "timestamp": timestamp,
                 "utc_time": utc_time,
+                "channel": channel_name,
+                "event_id": event_id,
+                "event_record_id": event_record_id,
+                "offline_fallback": is_offline_fallback,
                 "channel_info": channel_line,
                 "image": image,
                 "command_line": command_line,
@@ -449,16 +469,59 @@ def parse_events_jsonl(jsonl_path: Path) -> list[dict[str, Any]]:
                 "severity": sev,
                 "timestamp": str(item.get("timestamp") or ""),
                 "utc_time": str(item.get("utc_time") or ""),
+                "channel": str(item.get("channel") or ""),
+                "event_id": int(item.get("event_id") or 0),
+                "event_record_id": int(item.get("event_record_id") or 0),
+                "offline_fallback": bool(item.get("offline_fallback", False)),
                 "channel_info": str(item.get("channel_info") or ""),
                 "image": str(item.get("image") or ""),
                 "command_line": str(item.get("command_line") or ""),
                 "parent_command_line": str(item.get("parent_command_line") or ""),
-                "destination": str(item.get("destination") or ":None"),
+                "destination": str(item.get("destination") or ""),
                 "screening_reasons": reasons,
                 "ai_summary": str(item.get("ai_summary") or "")[:240],
             }
         )
     return entries
+
+
+def reconcile_offline_duplicates(entries: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], int]:
+    """
+    オフラインフォールバックによる暫定判定と、オンライン復旧後の再判定が同一
+    `(channel, event_id, event_record_id)` で両方記録されている場合、
+    再判定済みの最新結果のみを残して二重集計を防ぎます。
+    """
+    best_idx_by_key: dict[tuple[str, int, int], tuple[bool, int]] = {}
+    keys_for_idx: dict[int, tuple[str, int, int]] = {}
+
+    for idx, ev in enumerate(entries):
+        rec_id = int(ev.get("event_record_id") or 0)
+        if rec_id <= 0:
+            continue
+        ch_key = str(ev.get("channel") or ev.get("channel_info") or "").strip().lower()
+        eid = int(ev.get("event_id") or 0)
+        ev_key = (ch_key, eid, rec_id)
+        keys_for_idx[idx] = ev_key
+        is_online = not bool(ev.get("offline_fallback", False))
+
+        prev = best_idx_by_key.get(ev_key)
+        if prev is None:
+            best_idx_by_key[ev_key] = (is_online, idx)
+        else:
+            prev_online, _ = prev
+            # オンライン再判定があれば暫定オフラインより優先し、同等同士なら後発を採用
+            if (is_online and not prev_online) or (is_online == prev_online):
+                best_idx_by_key[ev_key] = (is_online, idx)
+
+    kept: list[dict[str, Any]] = []
+    removed = 0
+    for idx, ev in enumerate(entries):
+        ev_key = keys_for_idx.get(idx)
+        if ev_key is None or best_idx_by_key[ev_key][1] == idx:
+            kept.append(ev)
+        else:
+            removed += 1
+    return kept, removed
 
 
 def _normalize_cmd_signature(cmd: str) -> str:
@@ -470,9 +533,10 @@ def _normalize_cmd_signature(cmd: str) -> str:
 
 def summarize_incident_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     """
-    大量ログをそのまま AI へ渡さず、同一パターンの件数集約と重要イベント抽出を行い
-    トークン効率の高い構造化サマリーへ圧縮します。
+    大量ログをそのまま AI へ渡さず、オフライン暫定とオンライン再判定の重複名寄せ・
+    同一パターンの件数集約・重要イベント抽出を行ってトークン効率の高いサマリーへ圧縮します。
     """
+    reconciled_entries, removed_dups = reconcile_offline_duplicates(entries)
     counts = {
         config.SEVERITY_CLEAN: 0,
         config.SEVERITY_SUSPICIOUS: 0,
@@ -480,7 +544,7 @@ def summarize_incident_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     }
     groups: dict[tuple[str, str, str, str], dict[str, Any]] = {}
 
-    for ev in entries:
+    for ev in reconciled_entries:
         sev = ev["severity"]
         if sev in counts:
             counts[sev] += 1
@@ -488,6 +552,8 @@ def summarize_incident_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
         first_reason = (ev.get("screening_reasons") or [""])[0]
         cmd_sig = _normalize_cmd_signature(ev.get("command_line") or "")
         gkey = (sev, img_low, first_reason, cmd_sig)
+        raw_dest = (ev.get("destination") or "").strip()
+        has_dest = bool(raw_dest and raw_dest not in (":None", "なし"))
 
         if gkey not in groups:
             groups[gkey] = {
@@ -498,7 +564,7 @@ def summarize_incident_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
                 "image": ev.get("image", ""),
                 "sample_command_line": (ev.get("command_line") or "")[:300],
                 "sample_parent_command_line": (ev.get("parent_command_line") or "")[:200],
-                "destinations": [ev["destination"]] if ev.get("destination") and ev["destination"] != ":None" else [],
+                "destinations": [raw_dest] if has_dest else [],
                 "screening_reasons": ev.get("screening_reasons", [])[:3],
                 "ai_summary": ev.get("ai_summary", ""),
             }
@@ -506,9 +572,8 @@ def summarize_incident_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
             g = groups[gkey]
             g["count"] += 1
             g["last_seen"] = ev.get("timestamp", "")
-            dest = ev.get("destination") or ""
-            if dest and dest != ":None" and dest not in g["destinations"] and len(g["destinations"]) < 5:
-                g["destinations"].append(dest)
+            if has_dest and raw_dest not in g["destinations"] and len(g["destinations"]) < 5:
+                g["destinations"].append(raw_dest)
 
     crit_susp_groups = sorted(
         (g for g in groups.values() if g["severity"] in (config.SEVERITY_CRITICAL, config.SEVERITY_SUSPICIOUS)),
@@ -521,7 +586,8 @@ def summarize_incident_entries(entries: list[dict[str, Any]]) -> dict[str, Any]:
     )[:25]
 
     return {
-        "total_events": len(entries),
+        "total_events": len(reconciled_entries),
+        "reconciled_offline_duplicates": removed_dups,
         "severity_counts": counts,
         "critical_and_suspicious_groups": crit_susp_groups,
         "clean_top_groups": clean_top_groups,

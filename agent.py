@@ -1209,6 +1209,33 @@ class GeminiTriageAgent:
             "used_model": used_model,
         }
 
+    @staticmethod
+    def _format_md_inline_code(value: Any) -> str:
+        """
+        複数行やバッククォートを含む文字列を Markdown の1行インラインコードとして安全に整形します。
+        """
+        raw = "" if value is None else str(value)
+        if not raw:
+            return "``"
+        single_line = raw.replace("\r\n", "\n").replace("\r", "\n").replace("\n", " \\n ")
+        longest_run = max((len(m.group(0)) for m in re.finditer(r"`+", single_line)), default=0)
+        fence = "`" * (longest_run + 1)
+        if single_line.startswith("`") or single_line.endswith("`"):
+            return f"{fence} {single_line} {fence}"
+        return f"{fence}{single_line}{fence}"
+
+    @staticmethod
+    def _format_destination(dest_ip: Any, dest_port: Any) -> str:
+        """通信先 IP/ポートを表示用に整形します（非通信イベント時は 'なし'）。"""
+        ip = str(dest_ip or "").strip()
+        if not ip and dest_port is None:
+            return "なし"
+        if dest_port is None:
+            return ip
+        if not ip:
+            return f":{dest_port}"
+        return f"{ip}:{dest_port}"
+
     def append_triage_report(
         self,
         event: NormalizedEvent,
@@ -1270,6 +1297,11 @@ class GeminiTriageAgent:
         else:
             trace_md = "  - ツール追加呼び出しなし（初期イベント情報のみで判定完了）"
 
+        dest_display = self._format_destination(
+            trimmed.get("DestinationIp"), trimmed.get("DestinationPort")
+        )
+        jsonl_destination = "" if dest_display == "なし" else dest_display
+
         markdown_entry = (
             f"\n---\n\n"
             f"## {severity} インシデント・トリアージレポート ({timestamp_str})\n\n"
@@ -1277,11 +1309,11 @@ class GeminiTriageAgent:
             f"- **使用AIモデル**: `{display_model}`\n"
             f"- **監視チャネル**: `{event.channel}` (Event ID: `{event.event_id}`, Record ID: `{event.event_record_id}`)\n"
             f"- **イベント発生時刻 (UTC)**: `{trimmed['UtcTime']}`\n"
-            f"- **対象プロセス**: `{trimmed['Image']}` (PID: `{trimmed['ProcessId']}`)\n"
+            f"- **対象プロセス**: {self._format_md_inline_code(trimmed['Image'])} (PID: `{trimmed['ProcessId']}`)\n"
             f"- **プロセス生存・同一性照合**: {proc_check.reason}\n"
-            f"- **コマンドライン**: `{trimmed['CommandLine']}`\n"
-            f"- **親プロセス (PID: `{trimmed['ParentProcessId']}`)**: `{trimmed['ParentCommandLine']}`\n"
-            f"- **通信先**: `{trimmed['DestinationIp']}:{trimmed['DestinationPort']}`\n"
+            f"- **コマンドライン**: {self._format_md_inline_code(trimmed['CommandLine'])}\n"
+            f"- **親プロセス (PID: `{trimmed['ParentProcessId']}`)**: {self._format_md_inline_code(trimmed['ParentCommandLine'])}\n"
+            f"- **通信先**: `{dest_display}`\n"
             f"- **一次スクリーニング検知理由**:\n{reasons_md}\n"
             f"- **Gemini 自律調査ツール履歴 (最大 {self.max_depth} 往復中 {len(tool_trace)} 回実行)**:\n{trace_md}\n\n"
             f"### Gemini 分析・判定結果\n\n"
@@ -1304,7 +1336,7 @@ class GeminiTriageAgent:
             "command_line": redact_sensitive_text(str(trimmed.get("CommandLine") or "")),
             "parent_process_id": event.parent_process_id,
             "parent_command_line": redact_sensitive_text(str(trimmed.get("ParentCommandLine") or "")),
-            "destination": f"{trimmed.get('DestinationIp') or ''}:{trimmed.get('DestinationPort')}",
+            "destination": jsonl_destination,
             "screening_reasons": safe_reasons,
             "ai_summary": re.sub(r"\s+", " ", safe_report_text.strip())[:400],
         }

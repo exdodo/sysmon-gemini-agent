@@ -75,11 +75,57 @@ _SCRIPT_PATH_RE = re.compile(
     re.IGNORECASE,
 )
 
-# コマンド連結記号・難読化・インラインコード実行指定を検出（ホワイトリスト便乗バイパス対策）
-_CHAINING_OR_INLINE_RE = re.compile(
-    r"(?:&&|\|\||[;&|`]|(?:^|\s)(?:-|/)(?:c|cmd|command|ec|enc|encodedcommand)(?=$|\s))",
+# コマンド連結記号・改行・バッククォート（便乗実行防止のため常に遮断）
+_SHELL_CHAINING_RE = re.compile(r"(?:&&|\|\||[;&|`\r\n])")
+
+# インラインコード実行・エンコードコマンド等のフラグ指定
+_INLINE_EXEC_FLAG_RE = re.compile(
+    r"(?:^|\s)(?:-|/)(?:c|cmd|command|ec|enc|encodedcommand)(?=$|\s)",
     re.IGNORECASE,
 )
+
+# Windows が .cmd / .bat を起動する際の標準ラッパー形式: cmd.exe [/d] /c "<batch_path> ..."
+_CMD_BATCH_WRAPPER_RE = re.compile(
+    r'^\s*(?:"[^"]*\bcmd(?:\.exe)?"|\S*\bcmd(?:\.exe)?)\s+'
+    r'(?:(?:/[dsq]|/[a-z]:(?:on|off))\s+)*'
+    r'/c\s+(?P<body>.+)$',
+    re.IGNORECASE,
+)
+_LEADING_BATCH_PATH_RE = re.compile(
+    r'^\s*"*([a-zA-Z]:\\[^"\'\r\n<>|?*]+?\.(?:cmd|bat))"?(?=$|\s|")',
+    re.IGNORECASE,
+)
+
+# 後方互換性・参照用の複合パターン
+_CHAINING_OR_INLINE_RE = re.compile(
+    r"(?:&&|\|\||[;&|`\r\n]|(?:^|\s)(?:-|/)(?:c|cmd|command|ec|enc|encodedcommand)(?=$|\s))",
+    re.IGNORECASE,
+)
+
+
+def _extract_safe_cmd_wrapped_batch(img_base: str, cmd_raw: str) -> str | None:
+    """
+    `cmd.exe /c "<trusted>.cmd"` のような正規バッチラッパー起動である場合のみ、
+    先頭で呼び出される `.cmd` / `.bat` の正規化小文字フルパスを返します。
+    コマンド連結・ネストしたインラインフラグ・ディレクトリトラバーサルを含む場合は `None` を返します。
+    """
+    if img_base != "cmd.exe" or not cmd_raw:
+        return None
+    if _SHELL_CHAINING_RE.search(cmd_raw):
+        return None
+    match = _CMD_BATCH_WRAPPER_RE.match(cmd_raw)
+    if not match:
+        return None
+    body = match.group("body").strip()
+    if not body or _SHELL_CHAINING_RE.search(body) or _INLINE_EXEC_FLAG_RE.search(body):
+        return None
+    lead = _LEADING_BATCH_PATH_RE.match(body)
+    if not lead:
+        return None
+    batch_path = lead.group(1).strip().replace("/", "\\").lower()
+    if ".." in batch_path:
+        return None
+    return batch_path
 
 
 def _normalize_str_list(raw: Any) -> list[str]:
@@ -186,7 +232,9 @@ def is_event_allowlisted(
         for m in _SCRIPT_PATH_RE.finditer(cmd_raw)
     ]
 
-    cmd_has_chaining_or_inline = bool(_CHAINING_OR_INLINE_RE.search(cmd_raw))
+    has_shell_chaining = bool(_SHELL_CHAINING_RE.search(cmd_raw))
+    has_inline_flag = bool(_INLINE_EXEC_FLAG_RE.search(cmd_raw))
+    safe_wrapped_batch = _extract_safe_cmd_wrapped_batch(img_base, cmd_raw)
 
     for trusted_img in rules["trusted_images"]:
         if img_norm and img_norm == trusted_img.replace("/", "\\").lower():
@@ -201,7 +249,11 @@ def is_event_allowlisted(
         if (
             is_generic_interp
             and bool(cmd_scripts)
-            and not cmd_has_chaining_or_inline
+            and not has_shell_chaining
+            and (
+                not has_inline_flag
+                or (safe_wrapped_batch is not None and safe_wrapped_batch.startswith(p_norm))
+            )
             and all(sp.startswith(p_norm) and ".." not in sp for sp in cmd_scripts)
         ):
             return (True, f"trusted_image_prefixes (スクリプト) 一致: {prefix}")
@@ -210,9 +262,14 @@ def is_event_allowlisted(
         pat_low = pattern.lower()
         if not pat_low or pat_low not in cmd_lower:
             continue
-        # パターン自体が連結演算子等を含まない限り、コマンド連結/インライン実行便乗は許可しない
-        if cmd_has_chaining_or_inline and not _CHAINING_OR_INLINE_RE.search(pattern):
+        # 連結記号・改行・バッククォートを含む場合は常に拒否（パターン自体に含む場合を除く）
+        if has_shell_chaining and not _SHELL_CHAINING_RE.search(pattern):
             continue
+        # インラインフラグ (/c, -c, -enc 等) がある場合は正規 cmd.exe /c <trusted>.cmd ラッパーのみ許可
+        if has_inline_flag and not _INLINE_EXEC_FLAG_RE.search(pattern):
+            pat_norm = pat_low.replace("/", "\\")
+            if safe_wrapped_batch is None or safe_wrapped_batch != pat_norm:
+                continue
         return (True, f"trusted_command_line_contains 一致: {pattern}")
 
     if event.event_id == 22:
