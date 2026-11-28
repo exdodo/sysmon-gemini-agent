@@ -10,6 +10,7 @@ sys.path.insert(0, str(ROOT_DIR))
 
 from google.genai import types  # noqa: E402
 from google.genai.errors import APIError  # noqa: E402
+import httpx2  # noqa: E402
 
 import agent as agent_mod  # noqa: E402
 import config  # noqa: E402
@@ -163,6 +164,65 @@ class TestFlexTierRouting(unittest.TestCase):
         self.assertTrue(res["offline_fallback"])
         self.assertGreater(tri._api_offline_until, 0.0)
         self.assertEqual(len(created), 2)
+
+    def test_httpx2_read_timeout_retries_and_recovers_on_flex(self) -> None:
+        calls = {"count": 0}
+
+        def handler(message, cfg, created):
+            calls["count"] += 1
+            if calls["count"] == 1:
+                raise httpx2.ReadTimeout("The read operation timed out")
+            return _FakeResponse("判定レベル: [SUSPICIOUS]\n判定理由: recovered after timeout")
+
+        tri, created, _ = self._build_agent_with_fake_client(handler)
+        with patch.object(agent_mod.time, "sleep") as mock_sleep:
+            res = tri.investigate_event(_make_event(105))
+
+        self.assertEqual(res["severity"], config.SEVERITY_SUSPICIOUS)
+        self.assertEqual(res["service_tier"], "flex")
+        self.assertFalse(res["offline_fallback"])
+        self.assertEqual(calls["count"], 2)
+        self.assertEqual(mock_sleep.call_count, 1)
+        self.assertEqual(len(created), 1)
+
+    def test_httpx2_read_timeout_exhausted_on_flex_falls_back_to_standard(self) -> None:
+        calls = {"flex": 0, "standard": 0}
+
+        def handler(message, cfg, created):
+            if created[-1][2].service_tier == types.ServiceTier.FLEX:
+                calls["flex"] += 1
+                raise httpx2.ReadTimeout("The read operation timed out")
+            calls["standard"] += 1
+            return _FakeResponse("判定レベル: [SUSPICIOUS]\n判定理由: standard recovered")
+
+        tri, created, _ = self._build_agent_with_fake_client(handler)
+        with patch.object(agent_mod.time, "sleep") as mock_sleep:
+            res = tri.investigate_event(_make_event(106))
+
+        expected_flex_attempts = min(config.MAX_API_RETRIES, max(1, config.TIMEOUT_MAX_RETRIES))
+        self.assertEqual(res["service_tier"], "standard")
+        self.assertFalse(res["offline_fallback"])
+        self.assertEqual(calls["flex"], expected_flex_attempts)
+        self.assertEqual(calls["standard"], 1)
+        self.assertEqual(tri._flex_consecutive_errors, 1)
+        self.assertEqual(mock_sleep.call_count, expected_flex_attempts - 1)
+        self.assertEqual(len(created), 2)
+
+    def test_non_network_exception_does_not_retry(self) -> None:
+        calls = {"count": 0}
+
+        def handler(message, cfg, created):
+            calls["count"] += 1
+            raise ValueError("unexpected bug")
+
+        tri, created, _ = self._build_agent_with_fake_client(handler)
+        with patch.object(agent_mod.time, "sleep") as mock_sleep:
+            res = tri.investigate_event(_make_event(107))
+
+        self.assertTrue(res["offline_fallback"])
+        self.assertEqual(calls["count"], 1)
+        self.assertEqual(mock_sleep.call_count, 0)
+        self.assertEqual(len(created), 1)
 
 
 if __name__ == "__main__":

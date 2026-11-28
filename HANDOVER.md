@@ -1,9 +1,9 @@
 # HANDOVER.md — `sysmon-gemini-agent` 引き継ぎドキュメント
 
-> **最終更新日**: 2026-11-25  
+> **最終更新日**: 2026-11-28  
 > **対象ワークスペース**: `<repo-root>\sysmon-gemini-agent`  
 > **リモートリポジトリ**: `https://github.com/exdodo/sysmon-gemini-agent.git`（`main` / `origin/main`）  
-> **現在のリポジトリ最新状態**: `v1.32`（Sysmon ID 255 `GetConfigurationOptions` 書き込み禁止エラーの `[CRITICAL候補]` 格下げ対応）
+> **現在のリポジトリ最新状態**: `v1.33`（`httpx2` タイムアウトのリトライ＆`standard` フォールバック対応＋`EvtNext` チャンク分割取得による `1734` エラー解消）
 
 ---
 
@@ -64,7 +64,8 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 | `v1.20` (`0631eff`) | 2026-11-25 | ・`allowlist.py` の `trusted_image_prefixes` 部分一致バイパス修正、`process_guard.py` の System32 判定バグ修正、`sanitizer.py` による機微情報マスキング、Sysmon ID 255 権限エラーの過剰 CRITICAL 抑止、`tests/` 常設化・公開ドキュメント汎用化を実施。 |
 | `v1.30` (`115c36a`) | 2026-11-25 | ・プロンプトインジェクション隔離（`<UNTRUSTED_EVENT_DATA>` / `<UNTRUSTED_LOG_SUMMARY>` + Schema強制）、Sysmon ID `14` 対応・ID `8/10` 偽装パス対策・難読化 (`i`ex`, `-ec`, `ieframe.dll`) 対応・ホワイトリスト連結バイパス対策。<br>・`tray_app.py` 15秒巡回と `FlexTriageQueue`（重複統合・上限100）分離、`agent.py` 503/504 連続時30分通常ティア自動退避＋トレイ／CLI（`--standard-tier`）／`runtime_settings.json` 永続切替。<br>・`runtime_settings.py`（原子的JSON書込＋単一インスタンスMutex）、`ui_host.py`（単一Tkinter UIスレッド）、`events_YYYYMMDD.jsonl` 併記出力＋`daily_reviewer.py` / `log_retention.py` 対応、`start_agent.ps1` の `-SyncDeps` / `-StandardTier` 対応を実施。 |
 | `v1.31` (`56966b5`) | 2026-11-25 | ・`posture_check.py`（`winreg` Read-Only LSA/HVCI/TamperProtection/ASR 12ルール診断＋トレイ/CLI `--posture-check` 統合）および `harden_endpoint.ps1`（UTF-8 BOM、Windows PowerShell 5.1 で `Audit` / `ApplyAudit` / `CheckAsrLogs` / `ApplyBlock` / `Rollback`）を追加。 |
-| `v1.32` | 2026-11-25 | ・`event_reader.py`: Sysmon Event ID 255 (`GetConfigurationOptions`) の `書き込み禁止` / `write protected` エラーを `[CRITICAL候補]` から通常イベントへ格下げ（案A）。 |
+| `v1.32` (`7991da8`) | 2026-11-25 | ・`event_reader.py`: Sysmon Event ID 255 (`GetConfigurationOptions`) の `書き込み禁止` / `write protected` エラーを `[CRITICAL候補]` から通常イベントへ格下げ（案A）。 |
+| `v1.33` | 2026-11-28 | ・`agent.py` / `config.py`: `httpx2.ReadTimeout` 等のタイムアウト／トランスポート例外を指数バックオフ（最大2回）＋`standard` ティア切替対象に追加。<br>・`event_reader.py` / `tools.py`: `fetch_event_xmls_chunked()` により `EvtNext` をチャンク分割（既定 `32`、1734 発生時は半減リトライ）し、Sysmon RPC 1734 エラーとイベント滞留を解消。 |
 
 ---
 
@@ -72,7 +73,7 @@ Windows イベントログ（`Microsoft-Windows-Sysmon/Operational`, `Security`,
 
 | ファイル | 役割 |
 | :--- | :--- |
-| `config.py` | `APP_VERSION = "1.32"`、監視対象チャネル/ID（ID `14` 追加）、Flex キュー/503/504クールダウン定数、一次スクリーニング条件、保護プロセス一覧 |
+| `config.py` | `APP_VERSION = "1.33"`、監視対象チャネル/ID（ID `14` 追加）、`EVTLOG_NEXT_BATCH_SIZE`、Flex キュー/503/504クールダウン定数、一次スクリーニング条件、保護プロセス一覧 |
 | `posture_check.py` | OS 標準防御設定（LSA 保護・メモリ整合性・Defender ASR 12 ルール）の Read-Only 診断＋GUI表示 |
 | `harden_endpoint.ps1` | UTF-8 (BOM付き) PowerShell スクリプト（ASR 監査/ブロック導入、LSA/HVCI 有効化、`CheckAsrLogs`, `Rollback`） |
 | `runtime_settings.py` | 原子的 JSON 書込 (`atomic_write_json`)、`RuntimeSettings`（Flex/通常ティア永続管理）、Windows 単一インスタンス Mutex |

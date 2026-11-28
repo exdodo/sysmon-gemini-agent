@@ -17,6 +17,7 @@ from event_reader import (
     HAS_PSUTIL,
     HAS_PYWIN32,
     NormalizedEvent,
+    fetch_event_xmls_chunked,
     get_cached_events,
     parse_event_xml,
     psutil,
@@ -45,16 +46,18 @@ def _query_sysmon_events_readonly(xpath_query: str, max_results: int = 25) -> li
             xpath_query,
             None,
         )
-        raw_handles = win32evtlog.EvtNext(query_handle, max_results, 1500, 0)
-        for evt_handle in raw_handles:
-            try:
-                xml_str = win32evtlog.EvtRender(evt_handle, win32evtlog.EvtRenderEventXml)
-                parsed = parse_event_xml(xml_str, default_channel=config.SYSMON_CHANNEL)
-                if parsed is not None:
-                    register_event_in_cache(parsed)
-                    results.append(parsed)
-            except Exception as render_exc:
-                logger.debug("ツール内XMLレンダリング失敗: %s", render_exc)
+        raw_xmls = fetch_event_xmls_chunked(
+            query_handle,
+            max_events=max_results,
+            timeout_ms=1500,
+            batch_size=config.EVTLOG_NEXT_BATCH_SIZE,
+            channel=config.SYSMON_CHANNEL,
+        )
+        for xml_str in raw_xmls:
+            parsed = parse_event_xml(xml_str, default_channel=config.SYSMON_CHANNEL)
+            if parsed is not None:
+                register_event_in_cache(parsed)
+                results.append(parsed)
     except Exception as exc:
         logger.debug("Sysmon Read-Only クエリ失敗 (%s): %s", xpath_query, exc)
 
@@ -83,16 +86,18 @@ def _query_security_process_readonly(process_id: int, max_results: int = 10) -> 
             xpath_query,
             None,
         )
-        raw_handles = win32evtlog.EvtNext(query_handle, max_results, 1500, 0)
-        for evt_handle in raw_handles:
-            try:
-                xml_str = win32evtlog.EvtRender(evt_handle, win32evtlog.EvtRenderEventXml)
-                parsed = parse_event_xml(xml_str, default_channel=config.SECURITY_CHANNEL)
-                if parsed is not None:
-                    register_event_in_cache(parsed)
-                    results.append(parsed)
-            except Exception as render_exc:
-                logger.debug("Security 4688 XMLレンダリング失敗: %s", render_exc)
+        raw_xmls = fetch_event_xmls_chunked(
+            query_handle,
+            max_events=max_results,
+            timeout_ms=1500,
+            batch_size=config.EVTLOG_NEXT_BATCH_SIZE,
+            channel=config.SECURITY_CHANNEL,
+        )
+        for xml_str in raw_xmls:
+            parsed = parse_event_xml(xml_str, default_channel=config.SECURITY_CHANNEL)
+            if parsed is not None:
+                register_event_in_cache(parsed)
+                results.append(parsed)
     except Exception as exc:
         logger.debug("Security Read-Only クエリ失敗 (PID=%s): %s", process_id, exc)
 

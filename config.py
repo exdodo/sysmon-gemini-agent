@@ -13,7 +13,7 @@ from pathlib import Path
 # ============================================================================
 # アプリケーションバージョン定義 (機能追加時に更新し、CHANGELOG.md / Gitタグと同期)
 # ============================================================================
-APP_VERSION: str = "1.32"
+APP_VERSION: str = "1.33"
 
 # ============================================================================
 # パス設定 (ワークスペース内に閉じた設計・親ディレクトリへのアクセス禁止)
@@ -55,6 +55,7 @@ ALERTS_DIR_MAX_BYTES: int = 100 * 1024 * 1024
 # 早期検知のため 15 秒間隔で巡回（一次フィルタにより通常時のAPI消費はゼロ）
 POLL_INTERVAL_SECONDS: int = 15
 MAX_EVENTS_PER_POLL: int = 1000
+EVTLOG_NEXT_BATCH_SIZE: int = 32
 RECENT_EVENT_CACHE_SIZE: int = 4000
 
 # 監視対象チャネルおよび対象 Event ID
@@ -367,6 +368,7 @@ FLEX_COOLDOWN_SECONDS: int = int(os.environ.get("FLEX_COOLDOWN_SECONDS", "1800")
 
 # API レート制限 (429 / 503 / 504 / ResourceExhausted) および通信障害時の Exponential Backoff 設定
 MAX_API_RETRIES: int = 4
+TIMEOUT_MAX_RETRIES: int = 2
 INITIAL_BACKOFF_SECONDS: float = 2.0
 CONGESTION_INITIAL_BACKOFF_SECONDS: float = 5.0
 BACKOFF_MULTIPLIER: float = 2.0

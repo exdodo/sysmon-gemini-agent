@@ -2,6 +2,15 @@
 
 本プロジェクトの変更履歴およびバージョン管理記録です（`config.py` の `APP_VERSION` および Git タグと連動）。
 
+## [1.33] - 2026-11-28
+`httpx2` タイムアウト／トランスポート例外の指数バックオフリトライ＆通常ティアフォールバック漏れと、`EvtNext` 一括取得時の RPC `1734 (array bounds invalid)` によるイベント滞留を修正。
+
+### 修正
+- **`agent.py` / `config.py`**:
+  - `google-genai` 内部通信 (`httpx2`) が送出する `TimeoutException` (`ReadTimeout` 等) や `TransportError` を `_is_timeout_error` / `_is_transient_network_error` で捕捉し、指数バックオフリトライ（タイムアウト系は `TIMEOUT_MAX_RETRIES = 2` 回）および Flex 失敗時の `standard` ティア切替／連続障害カウントが正しく機能するよう修正（非ネットワーク例外は即再送出して無駄なリトライを防止）。
+- **`event_reader.py` / `tools.py` / `config.py`**:
+  - `fetch_event_xmls_chunked()` を追加し、`EvtNext` をチャンク単位（`EVTLOG_NEXT_BATCH_SIZE = 32`）でループ取得するよう変更。万一 `1734` が発生した場合はチャンクサイズを半減して自動再取得し、部分取得済みイベントも失わずチェックポイントを進められるよう改善。
+
 ## [1.32] - 2026-11-25
 Sysmon Event ID 255（`GetConfigurationOptions`）における起動・復帰時の一時的な書き込み禁止エラー（日英メッセージ対応）の過剰 `[CRITICAL候補]` 判定を緩和。
 

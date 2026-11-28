@@ -1000,6 +1000,85 @@ class CheckpointManager:
                 logger.error("checkpoint.json の保存に失敗しました: %s", exc)
 
 
+def _extract_winerror(exc: Exception) -> int | None:
+    """pywintypes.error / OSError から Win32/RPC エラーコードを抽出します。"""
+    winerror = getattr(exc, "winerror", None)
+    if isinstance(winerror, int):
+        return winerror
+    args = getattr(exc, "args", ())
+    if args and isinstance(args[0], int):
+        return args[0]
+    return None
+
+
+def fetch_event_xmls_chunked(
+    query_handle: Any,
+    max_events: int,
+    timeout_ms: int = 2000,
+    batch_size: int = config.EVTLOG_NEXT_BATCH_SIZE,
+    channel: str = "",
+) -> list[str]:
+    """
+    `win32evtlog.EvtNext` の一括取得バッファ上限による RPC エラー 1734
+    (`The array bounds are invalid`) を回避するため、小さいチャンク単位でループ取得して XML を返します。
+    1734 発生時はチャンクサイズを半減して自動リトライします。
+    """
+    if not HAS_PYWIN32 or win32evtlog is None:
+        return []
+
+    remaining = max(int(max_events), 0)
+    if remaining == 0:
+        return []
+
+    current_batch = max(1, min(int(batch_size), remaining))
+    xml_list: list[str] = []
+
+    while remaining > 0:
+        ask = min(current_batch, remaining)
+        try:
+            raw_handles = win32evtlog.EvtNext(query_handle, ask, timeout_ms, 0)
+        except Exception as next_exc:
+            code = _extract_winerror(next_exc)
+            if code in (259, 1460):  # ERROR_NO_MORE_ITEMS / ERROR_TIMEOUT
+                break
+            if code == 1734 and current_batch > 1:
+                next_batch = max(1, current_batch // 2)
+                logger.debug(
+                    "チャネル '%s' の EvtNext(%d) で 1734 (array bounds) が発生したため、チャンクサイズを %d に縮小して再取得します。",
+                    channel,
+                    ask,
+                    next_batch,
+                )
+                current_batch = next_batch
+                continue
+            logger.warning(
+                "チャネル '%s' からのイベント列挙中にエラーが発生しました (取得済=%d件, batch=%d): %s",
+                channel,
+                len(xml_list),
+                ask,
+                next_exc,
+            )
+            break
+
+        if not raw_handles:
+            break
+
+        for evt_handle in raw_handles:
+            remaining -= 1
+            try:
+                xml_str = win32evtlog.EvtRender(
+                    evt_handle, win32evtlog.EvtRenderEventXml
+                )
+                if xml_str:
+                    xml_list.append(xml_str)
+            except Exception as render_exc:
+                logger.debug("イベントXMLのレンダリング失敗: %s", render_exc)
+            if remaining <= 0:
+                break
+
+    return xml_list
+
+
 class WindowsEventReader:
     """
     pywin32 (`win32evtlog`) を用いて Windows イベントログを読み取り専用で取得するクラス。
@@ -1211,20 +1290,17 @@ class WindowsEventReader:
         if channel == config.SYSMON_CHANNEL:
             self.sysmon_available = True
 
-        try:
-            raw_handles = win32evtlog.EvtNext(query_handle, max_events, 2000, 0)
-            for evt_handle in raw_handles:
-                try:
-                    xml_str = win32evtlog.EvtRender(
-                        evt_handle, win32evtlog.EvtRenderEventXml
-                    )
-                    parsed = parse_event_xml(xml_str, default_channel=channel)
-                    if parsed is not None:
-                        events.append(parsed)
-                except Exception as render_exc:
-                    logger.debug("イベントXMLのレンダリング失敗: %s", render_exc)
-        except Exception as next_exc:
-            logger.warning("チャネル '%s' からのイベント列挙中にエラーが発生しました: %s", channel, next_exc)
+        raw_xmls = fetch_event_xmls_chunked(
+            query_handle,
+            max_events=max_events,
+            timeout_ms=2000,
+            batch_size=config.EVTLOG_NEXT_BATCH_SIZE,
+            channel=channel,
+        )
+        for xml_str in raw_xmls:
+            parsed = parse_event_xml(xml_str, default_channel=channel)
+            if parsed is not None:
+                events.append(parsed)
 
         # 件数0かつ既知の last_record_id > 0 の場合、ログ消去による EventRecordID 巻き戻りを点検
         if not events and last_record_id > 0 and not _rewind_checked:

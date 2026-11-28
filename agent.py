@@ -40,6 +40,30 @@ except ImportError:
     keyring = None  # type: ignore[assignment]
     HAS_KEYRING = False
 
+_TIMEOUT_EXCEPTIONS_LIST: list[type[BaseException]] = [TimeoutError]
+_TRANSIENT_NETWORK_EXCEPTIONS_LIST: list[type[BaseException]] = [
+    ConnectionError,
+    TimeoutError,
+    OSError,
+]
+for _http_mod_name in ("httpx2", "httpx"):
+    try:
+        _http_mod = __import__(_http_mod_name)
+    except ImportError:
+        continue
+    _timeout_exc = getattr(_http_mod, "TimeoutException", None)
+    _transport_exc = getattr(_http_mod, "TransportError", None)
+    if isinstance(_timeout_exc, type) and issubclass(_timeout_exc, BaseException):
+        _TIMEOUT_EXCEPTIONS_LIST.append(_timeout_exc)
+        _TRANSIENT_NETWORK_EXCEPTIONS_LIST.append(_timeout_exc)
+    if isinstance(_transport_exc, type) and issubclass(_transport_exc, BaseException):
+        _TRANSIENT_NETWORK_EXCEPTIONS_LIST.append(_transport_exc)
+
+_TIMEOUT_EXCEPTIONS: tuple[type[BaseException], ...] = tuple(dict.fromkeys(_TIMEOUT_EXCEPTIONS_LIST))
+_TRANSIENT_NETWORK_EXCEPTIONS: tuple[type[BaseException], ...] = tuple(
+    dict.fromkeys(_TRANSIENT_NETWORK_EXCEPTIONS_LIST)
+)
+
 import config
 from event_reader import NormalizedEvent
 import keyword_matcher
@@ -191,6 +215,57 @@ class GeminiTriageAgent:
             self.refresh_latest_model(force=True)
 
     @staticmethod
+    def _is_timeout_error(exc: Exception) -> bool:
+        """標準 TimeoutError および httpx2/httpx のタイムアウト例外かを判定します。"""
+        if isinstance(exc, _TIMEOUT_EXCEPTIONS):
+            return True
+        if isinstance(exc, APIError):
+            return False
+        cls_name = type(exc).__name__.lower()
+        if "timeout" in cls_name:
+            return True
+        err_msg = str(exc).lower()
+        return any(
+            token in err_msg
+            for token in ("read operation timed out", "timed out", "timeout")
+        )
+
+    @staticmethod
+    def _is_transient_network_error(exc: Exception) -> bool:
+        """リトライおよび通常ティア切替対象の一時的な通信・タイムアウト例外かを判定します。"""
+        if isinstance(exc, APIError):
+            return False
+        if isinstance(exc, _TRANSIENT_NETWORK_EXCEPTIONS):
+            return True
+        if GeminiTriageAgent._is_timeout_error(exc):
+            return True
+        cls_name = type(exc).__name__.lower()
+        if any(
+            tok in cls_name
+            for tok in (
+                "connecterror",
+                "networkerror",
+                "transporterror",
+                "protocolerror",
+                "proxyerror",
+                "readerror",
+                "writeerror",
+            )
+        ):
+            return True
+        err_msg = str(exc).lower()
+        return any(
+            tok in err_msg
+            for tok in (
+                "connection reset",
+                "connection aborted",
+                "remote protocol error",
+                "temporary failure in name resolution",
+                "server disconnected",
+            )
+        )
+
+    @staticmethod
     def _is_retryable_api_error(api_err: Exception) -> bool:
         """429/503 等の混雑エラーやタイムアウトが一時的な再試行対象かを判定します。"""
         status_code = getattr(api_err, "code", None)
@@ -253,13 +328,21 @@ class GeminiTriageAgent:
                 )
                 time.sleep(sleep_sec)
                 backoff = max(backoff, base_wait) * config.BACKOFF_MULTIPLIER
-            except (ConnectionError, TimeoutError, OSError) as net_err:
+            except Exception as net_err:
+                if not self._is_transient_network_error(net_err):
+                    raise
                 last_exception = net_err
-                if attempt == config.MAX_API_RETRIES:
+                is_timeout = self._is_timeout_error(net_err)
+                effective_max_retries = (
+                    min(config.MAX_API_RETRIES, max(1, config.TIMEOUT_MAX_RETRIES))
+                    if is_timeout
+                    else config.MAX_API_RETRIES
+                )
+                if attempt >= effective_max_retries:
                     logger.error(
                         "ネットワーク通信エラーが解消しませんでした (%d/%d): %s",
                         attempt,
-                        config.MAX_API_RETRIES,
+                        effective_max_retries,
                         net_err,
                     )
                     raise
@@ -269,7 +352,7 @@ class GeminiTriageAgent:
                     net_err,
                     sleep_sec,
                     attempt,
-                    config.MAX_API_RETRIES,
+                    effective_max_retries,
                 )
                 time.sleep(sleep_sec)
                 backoff *= config.BACKOFF_MULTIPLIER
@@ -865,9 +948,9 @@ class GeminiTriageAgent:
                             continue
                         raise
             except Exception as tier_exc:
-                is_congestion_or_net = isinstance(
-                    tier_exc, (ConnectionError, TimeoutError, OSError)
-                ) or (isinstance(tier_exc, APIError) and self._is_retryable_api_error(tier_exc))
+                is_congestion_or_net = self._is_transient_network_error(tier_exc) or (
+                    isinstance(tier_exc, APIError) and self._is_retryable_api_error(tier_exc)
+                )
 
                 if service_tier == "flex" and is_congestion_or_net:
                     with self._state_lock:
